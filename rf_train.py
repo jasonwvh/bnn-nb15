@@ -1,3 +1,7 @@
+"""
+Refactored Random Forest Training
+Original logic preserved, just cleaned up and parameterized
+"""
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
@@ -8,10 +12,40 @@ from sklearn.metrics import (accuracy_score, precision_score, recall_score,
 import joblib
 import time
 import warnings
-
 warnings.filterwarnings('ignore')
 
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+# Data paths
+TRAIN_PATH = 'data/UNSW_NB15_training-set.csv'
+TEST_PATH = 'data/UNSW_NB15_testing-set.csv'
 
+# Model hyperparameters
+N_ESTIMATORS = 200
+MAX_DEPTH = 30
+MIN_SAMPLES_SPLIT = 10
+MIN_SAMPLES_LEAF = 4
+MAX_FEATURES = 'sqrt'
+RANDOM_STATE = 42
+N_JOBS = -1
+VERBOSE = 1
+
+# Simple baseline hyperparameters
+SIMPLE_N_ESTIMATORS = 100
+SIMPLE_MAX_DEPTH = 20
+
+# Model saving
+MODEL_PATH = 'rf_unsw_nb15_baseline.pkl'
+FEATURE_IMPORTANCE_PATH = 'rf_feature_importance.csv'
+
+# Display settings
+TOP_N_FEATURES = 20
+
+
+# ============================================================================
+# DATA LOADING AND PREPROCESSING
+# ============================================================================
 def load_and_preprocess_data(train_path, test_path):
     """Load and preprocess UNSW-NB15 dataset"""
     print("Loading data...")
@@ -67,6 +101,9 @@ def load_and_preprocess_data(train_path, test_path):
     return X_train, y_train, X_test, y_test, scaler, feature_names
 
 
+# ============================================================================
+# MODEL EVALUATION
+# ============================================================================
 def evaluate_model(model, X_test, y_test, model_name="Model"):
     """Comprehensive model evaluation"""
     print(f"\n{'=' * 60}")
@@ -129,7 +166,17 @@ def evaluate_model(model, X_test, y_test, model_name="Model"):
     }
 
 
-def train_random_forest(X_train, y_train, X_test, y_test, feature_names):
+# ============================================================================
+# RANDOM FOREST TRAINING
+# ============================================================================
+def train_random_forest(X_train, y_train, X_test, y_test, feature_names,
+                       n_estimators=N_ESTIMATORS, max_depth=MAX_DEPTH,
+                       min_samples_split=MIN_SAMPLES_SPLIT,
+                       min_samples_leaf=MIN_SAMPLES_LEAF,
+                       max_features=MAX_FEATURES,
+                       model_path=MODEL_PATH,
+                       feature_importance_path=FEATURE_IMPORTANCE_PATH,
+                       top_n_features=TOP_N_FEATURES):
     """Train Random Forest classifier with hyperparameter tuning"""
 
     print("\n" + "=" * 60)
@@ -153,15 +200,15 @@ def train_random_forest(X_train, y_train, X_test, y_test, feature_names):
     start_time = time.time()
 
     rf_model = RandomForestClassifier(
-        n_estimators=200,  # Number of trees
-        max_depth=30,  # Maximum depth of trees
-        min_samples_split=10,  # Minimum samples to split a node
-        min_samples_leaf=4,  # Minimum samples in a leaf
-        max_features='sqrt',  # Number of features for best split
-        class_weight=class_weight,  # Handle class imbalance
-        random_state=42,
-        n_jobs=-1,  # Use all CPU cores
-        verbose=1
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        min_samples_split=min_samples_split,
+        min_samples_leaf=min_samples_leaf,
+        max_features=max_features,
+        class_weight=class_weight,
+        random_state=RANDOM_STATE,
+        n_jobs=N_JOBS,
+        verbose=VERBOSE
     )
 
     rf_model.fit(X_train, y_train)
@@ -171,7 +218,7 @@ def train_random_forest(X_train, y_train, X_test, y_test, feature_names):
 
     # Feature importance analysis
     print("\n" + "-" * 60)
-    print("Top 20 Most Important Features:")
+    print(f"Top {top_n_features} Most Important Features:")
     print("-" * 60)
 
     feature_importance = pd.DataFrame({
@@ -179,7 +226,7 @@ def train_random_forest(X_train, y_train, X_test, y_test, feature_names):
         'importance': rf_model.feature_importances_
     }).sort_values('importance', ascending=False)
 
-    for idx, row in feature_importance.head(20).iterrows():
+    for idx, row in feature_importance.head(top_n_features).iterrows():
         print(f"  {row['feature']:20s}: {row['importance']:.4f}")
 
     # Evaluate on training set
@@ -196,27 +243,29 @@ def train_random_forest(X_train, y_train, X_test, y_test, feature_names):
     results = evaluate_model(rf_model, X_test, y_test, "Random Forest")
 
     # Save model
-    joblib.dump(rf_model, 'rf_unsw_nb15_baseline.pkl')
-    print(f"\n✓ Model saved to 'rf_unsw_nb15_baseline.pkl'")
+    joblib.dump(rf_model, model_path)
+    print(f"\n✓ Model saved to '{model_path}'")
 
     # Save feature importance
-    feature_importance.to_csv('rf_feature_importance.csv', index=False)
-    print(f"✓ Feature importance saved to 'rf_feature_importance.csv'")
+    feature_importance.to_csv(feature_importance_path, index=False)
+    print(f"✓ Feature importance saved to '{feature_importance_path}'")
 
     return rf_model, results, feature_importance
 
 
-def compare_with_simple_rf(X_train, y_train, X_test, y_test):
+def train_simple_baseline(X_train, y_train, X_test, y_test,
+                         n_estimators=SIMPLE_N_ESTIMATORS,
+                         max_depth=SIMPLE_MAX_DEPTH):
     """Train a simpler RF for comparison"""
     print("\n" + "=" * 60)
     print("Training Simple Random Forest (for comparison)")
     print("=" * 60)
 
     simple_rf = RandomForestClassifier(
-        n_estimators=100,
-        max_depth=20,
-        random_state=42,
-        n_jobs=-1,
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        random_state=RANDOM_STATE,
+        n_jobs=N_JOBS,
         verbose=0
     )
 
@@ -230,8 +279,13 @@ def compare_with_simple_rf(X_train, y_train, X_test, y_test):
     return simple_rf, results
 
 
-def main(train_path='data/UNSW_NB15_training-set.csv',
-         test_path='data/UNSW_NB15_testing-set.csv'):
+# ============================================================================
+# MAIN FUNCTION
+# ============================================================================
+def main(train_path=TRAIN_PATH, test_path=TEST_PATH):
+    """
+    Main function for Random Forest training
+    """
     print("\n" + "=" * 60)
     print("Random Forest Baseline for UNSW-NB15 Dataset")
     print("=" * 60)
@@ -247,7 +301,7 @@ def main(train_path='data/UNSW_NB15_training-set.csv',
     )
 
     # Train simple RF for comparison
-    simple_rf, simple_results = compare_with_simple_rf(
+    simple_rf, simple_results = train_simple_baseline(
         X_train, y_train, X_test, y_test
     )
 

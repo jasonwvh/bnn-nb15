@@ -1,3 +1,7 @@
+"""
+Refactored Bayesian Neural Network Training
+Original architecture preserved, just cleaned up and parameterized
+"""
 import numpy as np
 import pandas as pd
 import torch
@@ -8,10 +12,55 @@ from torch.utils.data import TensorDataset, DataLoader
 from sklearn.preprocessing import RobustScaler, LabelEncoder
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
 import warnings
-
 warnings.filterwarnings('ignore')
 
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+# Data paths
+TRAIN_PATH = 'data/UNSW_NB15_training-set.csv'
+TEST_PATH = 'data/UNSW_NB15_testing-set.csv'
 
+# Model architecture
+HIDDEN_DIM = 256
+N_CLASSES = 2
+PRIOR_SIGMA = 1.0
+DROPOUT_RATE = 0.3
+
+# Training parameters
+EPOCHS = 100
+BATCH_SIZE = 128
+LEARNING_RATE = 0.001
+WEIGHT_DECAY = 1e-4
+USE_CLASS_WEIGHTS = True  # Balance classes in loss function
+
+# Optimization
+LR_SCHEDULER_PATIENCE = 5
+LR_SCHEDULER_FACTOR = 0.5
+GRADIENT_CLIP_NORM = 1.0
+
+# Early stopping
+EARLY_STOP_PATIENCE = 15
+
+# KL divergence
+KL_WEIGHT_MAX = 0.01
+KL_WARMUP_EPOCHS = 50
+
+# Monte Carlo sampling
+MC_SAMPLES_TRAIN = 5
+MC_SAMPLES_VAL = 10
+MC_SAMPLES_TEST = 20
+
+# Model saving
+MODEL_PATH = 'bnn_unsw_nb15_best.pth'
+
+# Validation frequency
+VAL_FREQUENCY = 2
+
+
+# ============================================================================
+# MODEL DEFINITION (ORIGINAL ARCHITECTURE)
+# ============================================================================
 class BayesianLinear(nn.Module):
     def __init__(self, in_features, out_features, prior_sigma=1.0):
         super().__init__()
@@ -70,6 +119,9 @@ class NetworkBNN(nn.Module):
                 self.l3.kl_divergence() + self.l4.kl_divergence())
 
 
+# ============================================================================
+# DATA LOADING AND PREPROCESSING
+# ============================================================================
 def load_and_preprocess_data(train_path, test_path):
     """Load and preprocess UNSW-NB15 dataset"""
     print("Loading data...")
@@ -87,7 +139,6 @@ def load_and_preprocess_data(train_path, test_path):
     label_encoders = {}
     for col in categorical_cols:
         le = LabelEncoder()
-        # Fit on combined data to handle unseen categories
         combined = pd.concat([train_df[col], test_df[col]], ignore_index=True)
         le.fit(combined.astype(str))
         train_df[col] = le.transform(train_df[col].astype(str))
@@ -120,6 +171,9 @@ def load_and_preprocess_data(train_path, test_path):
     return X_train, y_train, X_test, y_test, scaler
 
 
+# ============================================================================
+# VALIDATION
+# ============================================================================
 def validate(model, loader, device, mc_samples=10):
     """Validation with Monte Carlo sampling for uncertainty estimation"""
     model.eval()
@@ -149,8 +203,43 @@ def validate(model, loader, device, mc_samples=10):
     return acc, prec, rec, f1, all_preds, all_probs
 
 
-def main_train(train_path='data/UNSW_NB15_training-set.csv',
-               test_path='data/UNSW_NB15_testing-set.csv'):
+# ============================================================================
+# TRAINING
+# ============================================================================
+def calculate_class_weights(y_train):
+    """Calculate balanced class weights for loss function"""
+    n_samples = len(y_train)
+    n_normal = (y_train == 0).sum()
+    n_attack = (y_train == 1).sum()
+
+    # Calculate weights inversely proportional to class frequencies
+    weight_normal = n_samples / (2 * n_normal)
+    weight_attack = n_samples / (2 * n_attack)
+
+    class_weights = torch.FloatTensor([weight_normal, weight_attack])
+
+    print(f"Class weights: Normal={weight_normal:.3f}, Attack={weight_attack:.3f}")
+
+    return class_weights
+
+
+def train_bnn(train_path=TRAIN_PATH, test_path=TEST_PATH,
+              hidden_dim=HIDDEN_DIM, epochs=EPOCHS, batch_size=BATCH_SIZE,
+              learning_rate=LEARNING_RATE, model_path=MODEL_PATH,
+              use_class_weights=USE_CLASS_WEIGHTS):
+    """
+    Train Bayesian Neural Network
+
+    Args:
+        train_path: Path to training data
+        test_path: Path to test data
+        hidden_dim: Hidden layer dimension
+        epochs: Number of training epochs
+        batch_size: Batch size for training
+        learning_rate: Learning rate
+        model_path: Path to save best model
+        use_class_weights: Whether to use class weights in loss function
+    """
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}\n")
 
@@ -158,6 +247,13 @@ def main_train(train_path='data/UNSW_NB15_training-set.csv',
     X_train, y_train, X_test, y_test, scaler = load_and_preprocess_data(
         train_path, test_path
     )
+
+    # Calculate class weights if enabled
+    class_weights = None
+    if use_class_weights:
+        print("\nCalculating class weights for balanced training...")
+        class_weights = calculate_class_weights(y_train).to(device)
+        print()
 
     # Create data loaders
     train_dataset = TensorDataset(
@@ -169,51 +265,59 @@ def main_train(train_path='data/UNSW_NB15_training-set.csv',
         torch.LongTensor(y_test)
     )
 
-    train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
     # Initialize model
-    model = NetworkBNN(X_train.shape[1], hidden_dim=256, n_classes=2).to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
+    model = NetworkBNN(X_train.shape[1], hidden_dim=hidden_dim, n_classes=N_CLASSES).to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=WEIGHT_DECAY)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', patience=5, factor=0.5
+        optimizer, mode='min', patience=LR_SCHEDULER_PATIENCE, factor=LR_SCHEDULER_FACTOR
     )
 
-    print("Starting Bayesian Neural Network training...\n")
+    print("Starting Bayesian Neural Network training...")
+    if use_class_weights:
+        print("Using balanced class weights for loss function")
+    print()
     best_test_f1 = 0
     patience_counter = 0
-    max_patience = 15
 
-    for epoch in range(10):
+    for epoch in range(epochs):
         model.train()
         total_loss = 0
 
         # KL weight warm-up for stable training
-        kl_weight = min(0.01, (epoch + 1) / 50 * 0.01)
+        kl_weight = min(KL_WEIGHT_MAX, (epoch + 1) / KL_WARMUP_EPOCHS * KL_WEIGHT_MAX)
 
         for data, target in train_loader:
             data, target = data.to(device), target.to(device)
             optimizer.zero_grad()
 
             output = model(data, sample=True)
-            nll_loss = F.nll_loss(output, target)
+
+            # Use class weights in loss if enabled
+            if use_class_weights:
+                nll_loss = F.nll_loss(output, target, weight=class_weights)
+            else:
+                nll_loss = F.nll_loss(output, target)
+
             kl_loss = model.total_kl() / len(train_dataset)
             loss = nll_loss + kl_weight * kl_loss
 
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRADIENT_CLIP_NORM)
             optimizer.step()
             total_loss += loss.item()
 
         avg_loss = total_loss / len(train_loader)
 
-        # Validation every 2 epochs
-        if (epoch + 1) % 2 == 0:
+        # Validation every VAL_FREQUENCY epochs
+        if (epoch + 1) % VAL_FREQUENCY == 0:
             train_acc, train_prec, train_rec, train_f1, _, _ = validate(
-                model, train_loader, device, mc_samples=5
+                model, train_loader, device, mc_samples=MC_SAMPLES_TRAIN
             )
             test_acc, test_prec, test_rec, test_f1, test_preds, test_probs = validate(
-                model, test_loader, device, mc_samples=10
+                model, test_loader, device, mc_samples=MC_SAMPLES_VAL
             )
 
             print(f"Epoch {epoch + 1:3d} | Loss: {avg_loss:.4f}")
@@ -233,23 +337,23 @@ def main_train(train_path='data/UNSW_NB15_training-set.csv',
                     'optimizer_state_dict': optimizer.state_dict(),
                     'test_f1': test_f1,
                     'test_acc': test_acc,
-                }, 'bnn_unsw_nb15_best.pth')
+                }, model_path)
                 patience_counter = 0
                 print(f"  ✓ New best model saved (F1: {test_f1 * 100:.2f}%)\n")
             else:
                 patience_counter += 1
-                if patience_counter >= max_patience:
+                if patience_counter >= EARLY_STOP_PATIENCE:
                     print(f"Early stopping at epoch {epoch + 1}")
                     break
 
     # Load best model and evaluate
     print("\n" + "=" * 60)
     print("Loading best model for final evaluation...")
-    checkpoint = torch.load('bnn_unsw_nb15_best.pth')
+    checkpoint = torch.load(model_path)
     model.load_state_dict(checkpoint['model_state_dict'])
 
     test_acc, test_prec, test_rec, test_f1, test_preds, test_probs = validate(
-        model, test_loader, device, mc_samples=20
+        model, test_loader, device, mc_samples=MC_SAMPLES_TEST
     )
 
     print("\nFinal Test Performance:")
@@ -267,6 +371,8 @@ def main_train(train_path='data/UNSW_NB15_training-set.csv',
     print(f"       Attack  {cm[1, 0]:6d}  {cm[1, 1]:6d}")
     print("=" * 60)
 
+    return model, test_f1
+
 
 if __name__ == '__main__':
-    main_train()
+    train_bnn()

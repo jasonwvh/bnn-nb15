@@ -1,15 +1,40 @@
+"""
+Refactored BNN Prediction with Uncertainty Quantification
+Original logic preserved, just cleaned up and parameterized
+"""
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import TensorDataset, DataLoader
-from sklearn.preprocessing import RobustScaler, LabelEncoder
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
 import warnings
 warnings.filterwarnings('ignore')
-from train_bnn import NetworkBNN, load_and_preprocess_data
+from bnn_train import NetworkBNN, load_and_preprocess_data
 
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+# Paths
+MODEL_PATH = 'bnn_unsw_nb15_best.pth'
+TRAIN_PATH = 'data/UNSW_NB15_training-set.csv'
+TEST_PATH = 'data/UNSW_NB15_testing-set.csv'
+OUTPUT_PATH = 'predictions_with_uncertainty.csv'
+
+# Prediction parameters
+MC_SAMPLES = 50
+BATCH_SIZE = 128
+
+# Uncertainty thresholds
+UNCERTAINTY_THRESHOLD_PERCENTILE = 90
+HIGH_CONFIDENCE_THRESHOLD = 0.95
+
+# Display settings
+N_SAMPLE_PREDICTIONS = 5
+
+
+# ============================================================================
+# PREDICTION WITH UNCERTAINTY
+# ============================================================================
 def predict_with_uncertainty(model, data_loader, device, mc_samples=50):
     """
     Predict with uncertainty quantification using Monte Carlo sampling
@@ -77,7 +102,11 @@ def predict_with_uncertainty(model, data_loader, device, mc_samples=50):
             np.array(all_targets))
 
 
-def analyze_uncertainty(predictions, uncertainties, confidences, targets):
+# ============================================================================
+# UNCERTAINTY ANALYSIS
+# ============================================================================
+def analyze_uncertainty(predictions, uncertainties, confidences, targets,
+                       uncertainty_threshold_percentile=90):
     """Analyze uncertainty metrics"""
     correct = predictions == targets
 
@@ -104,18 +133,21 @@ def analyze_uncertainty(predictions, uncertainties, confidences, targets):
         print(f"  {percentile}th percentile: {value:.4f}")
 
     # High uncertainty samples
-    high_uncertainty_threshold = np.percentile(uncertainties, 90)
+    high_uncertainty_threshold = np.percentile(uncertainties, uncertainty_threshold_percentile)
     high_uncertainty_mask = uncertainties > high_uncertainty_threshold
     high_unc_accuracy = correct[high_uncertainty_mask].mean()
 
-    print(f"\nHigh Uncertainty Samples (top 10%):")
+    print(f"\nHigh Uncertainty Samples (top {100-uncertainty_threshold_percentile}%):")
     print(f"  Count: {high_uncertainty_mask.sum()}")
     print(f"  Accuracy: {high_unc_accuracy * 100:.2f}%")
     print(f"  These samples may require human review or additional investigation")
 
 
+# ============================================================================
+# SAVE AND DISPLAY PREDICTIONS
+# ============================================================================
 def save_predictions(predictions, confidences, uncertainties, probs,
-                     targets, output_path='predictions_with_uncertainty.csv'):
+                     targets, output_path=OUTPUT_PATH):
     """Save predictions with uncertainty metrics to CSV"""
     results_df = pd.DataFrame({
         'true_label': targets,
@@ -133,10 +165,41 @@ def save_predictions(predictions, confidences, uncertainties, probs,
     return results_df
 
 
-def main_classify(model_path='bnn_unsw_nb15_best.pth',
-                  train_path='data/UNSW_NB15_training-set.csv',
-                  test_path='data/UNSW_NB15_testing-set.csv',
-                  mc_samples=50):
+def show_sample_predictions(results_df, n_samples=5, high_conf_threshold=0.95):
+    """Display sample predictions"""
+    print("\n" + "=" * 70)
+    print("SAMPLE PREDICTIONS")
+    print("=" * 70)
+
+    print(f"\nHigh Confidence Correct Predictions (top {n_samples}):")
+    high_conf_correct = results_df[(results_df['correct']) &
+                                   (results_df['confidence'] > high_conf_threshold)].head(n_samples)
+    print(high_conf_correct[['prediction', 'confidence', 'uncertainty',
+                             'prob_normal', 'prob_attack']].to_string(index=False))
+
+    print(f"\nHigh Uncertainty Predictions (top {n_samples}):")
+    high_unc = results_df.nlargest(n_samples, 'uncertainty')
+    print(high_unc[['prediction', 'confidence', 'uncertainty', 'correct']].to_string(index=False))
+
+    print(f"\nMisclassifications with High Confidence (top {n_samples}):")
+    high_conf_wrong = results_df[(~results_df['correct']) &
+                                 (results_df['confidence'] > 0.8)].head(n_samples)
+    if len(high_conf_wrong) > 0:
+        print(high_conf_wrong[['true_label', 'predicted_label', 'confidence',
+                               'uncertainty']].to_string(index=False))
+    else:
+        print("  None found (good!)")
+
+
+# ============================================================================
+# MAIN CLASSIFICATION FUNCTION
+# ============================================================================
+def main_classify(model_path=MODEL_PATH,
+                  train_path=TRAIN_PATH,
+                  test_path=TEST_PATH,
+                  mc_samples=MC_SAMPLES,
+                  batch_size=BATCH_SIZE,
+                  output_path=OUTPUT_PATH):
     """
     Main classification function with uncertainty quantification
 
@@ -145,6 +208,8 @@ def main_classify(model_path='bnn_unsw_nb15_best.pth',
         train_path: Path to training data (needed for preprocessing)
         test_path: Path to test data
         mc_samples: Number of Monte Carlo samples for uncertainty estimation
+        batch_size: Batch size for inference
+        output_path: Path to save predictions CSV
     """
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}\n")
@@ -159,7 +224,7 @@ def main_classify(model_path='bnn_unsw_nb15_best.pth',
         torch.FloatTensor(X_test),
         torch.LongTensor(y_test)
     )
-    test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
     # Initialize and load model
     print(f"Loading model from: {model_path}")
@@ -208,32 +273,15 @@ def main_classify(model_path='bnn_unsw_nb15_best.pth',
     print(f"    False Negatives: {cm[1, 0]} (attack misclassified as normal)")
 
     # Analyze uncertainty
-    analyze_uncertainty(predictions, uncertainties, confidences, targets)
+    analyze_uncertainty(predictions, uncertainties, confidences, targets,
+                       UNCERTAINTY_THRESHOLD_PERCENTILE)
 
     # Save predictions
     results_df = save_predictions(predictions, confidences, uncertainties,
-                                  probs, targets)
+                                  probs, targets, output_path)
 
     # Show some example predictions
-    print("\n" + "=" * 70)
-    print("SAMPLE PREDICTIONS")
-    print("=" * 70)
-
-    print("\nHigh Confidence Correct Predictions:")
-    high_conf_correct = results_df[(results_df['correct']) & (results_df['confidence'] > 0.95)].head(5)
-    print(high_conf_correct[['prediction', 'confidence', 'uncertainty', 'prob_normal', 'prob_attack']].to_string(
-        index=False))
-
-    print("\nHigh Uncertainty Predictions:")
-    high_unc = results_df.nlargest(5, 'uncertainty')
-    print(high_unc[['prediction', 'confidence', 'uncertainty', 'correct']].to_string(index=False))
-
-    print("\nMisclassifications with High Confidence:")
-    high_conf_wrong = results_df[(~results_df['correct']) & (results_df['confidence'] > 0.8)].head(5)
-    if len(high_conf_wrong) > 0:
-        print(high_conf_wrong[['true_label', 'predicted_label', 'confidence', 'uncertainty']].to_string(index=False))
-    else:
-        print("  None found (good!)")
+    show_sample_predictions(results_df, N_SAMPLE_PREDICTIONS, HIGH_CONFIDENCE_THRESHOLD)
 
     print("\n" + "=" * 70)
     print("Classification complete!")
@@ -244,9 +292,4 @@ def main_classify(model_path='bnn_unsw_nb15_best.pth',
 
 if __name__ == '__main__':
     # Run classification with uncertainty quantification
-    results = main_classify(
-        model_path='bnn_unsw_nb15_best.pth',
-        train_path='data/UNSW_NB15_training-set.csv',
-        test_path='data/UNSW_NB15_testing-set.csv',
-        mc_samples=50  # Higher = more accurate uncertainty but slower
-    )
+    results = main_classify()
