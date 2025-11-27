@@ -36,8 +36,8 @@ SIMPLE_N_ESTIMATORS = 100
 SIMPLE_MAX_DEPTH = 20
 
 # Model saving
-MODEL_PATH = 'rf_unsw_nb15_baseline.pkl'
-FEATURE_IMPORTANCE_PATH = 'rf_feature_importance.csv'
+MODEL_PATH = 'models/rf.pkl'
+FEATURE_IMPORTANCE_PATH = 'models/rf_feature_importance.csv'
 
 # Display settings
 TOP_N_FEATURES = 20
@@ -253,9 +253,9 @@ def train_random_forest(X_train, y_train, X_test, y_test, feature_names,
     return rf_model, results, feature_importance
 
 
-def train_simple_baseline(X_train, y_train, X_test, y_test,
-                         n_estimators=SIMPLE_N_ESTIMATORS,
-                         max_depth=SIMPLE_MAX_DEPTH):
+def train_random_forest_simple(X_train, y_train, X_test, y_test,
+                               n_estimators=SIMPLE_N_ESTIMATORS,
+                               max_depth=SIMPLE_MAX_DEPTH):
     """Train a simpler RF for comparison"""
     print("\n" + "=" * 60)
     print("Training Simple Random Forest (for comparison)")
@@ -301,7 +301,7 @@ def main(train_path=TRAIN_PATH, test_path=TEST_PATH):
     )
 
     # Train simple RF for comparison
-    simple_rf, simple_results = train_simple_baseline(
+    simple_rf, simple_results = train_random_forest_simple(
         X_train, y_train, X_test, y_test
     )
 

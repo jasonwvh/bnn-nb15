@@ -52,7 +52,7 @@ MC_SAMPLES_VAL = 10
 MC_SAMPLES_TEST = 20
 
 # Model saving
-MODEL_PATH = 'bnn_unsw_nb15_best.pth'
+MODEL_PATH = 'models/bnn.pth'
 
 # Validation frequency
 VAL_FREQUENCY = 2

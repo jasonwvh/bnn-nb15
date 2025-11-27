@@ -18,7 +18,7 @@ from bnn_train import NetworkBNN, load_and_preprocess_data
 MODEL_PATH = 'bnn_unsw_nb15_best.pth'
 TRAIN_PATH = 'data/UNSW_NB15_training-set.csv'
 TEST_PATH = 'data/UNSW_NB15_testing-set.csv'
-OUTPUT_PATH = 'predictions_with_uncertainty.csv'
+OUTPUT_PATH = 'models/predictions.csv'
 
 # Prediction parameters
 MC_SAMPLES = 50
