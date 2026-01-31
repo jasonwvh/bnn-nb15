@@ -328,7 +328,7 @@ def train_bnn(train_path=TRAIN_PATH, test_path=TEST_PATH,
 
             scheduler.step(avg_loss)
 
-            # Save best model based on F1-score
+            # Save best model based on F1-score (outputs single model file: models/bnn.pth)
             if test_f1 > best_test_f1:
                 best_test_f1 = test_f1
                 torch.save({
@@ -337,6 +337,9 @@ def train_bnn(train_path=TRAIN_PATH, test_path=TEST_PATH,
                     'optimizer_state_dict': optimizer.state_dict(),
                     'test_f1': test_f1,
                     'test_acc': test_acc,
+                    'input_dim': X_train.shape[1],
+                    'hidden_dim': hidden_dim,
+                    'n_classes': N_CLASSES,
                 }, model_path)
                 patience_counter = 0
                 print(f"  ✓ New best model saved (F1: {test_f1 * 100:.2f}%)\n")

@@ -1,0 +1,6 @@
+# UBCL / BNN + RF for UNSW-NB15
+numpy>=1.20,<3
+pandas>=1.3,<3
+scikit-learn>=1.0,<2
+torch>=1.9,<3
+joblib>=1.0

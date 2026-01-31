@@ -6,7 +6,15 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import TensorDataset, DataLoader
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    confusion_matrix,
+    roc_auc_score,
+    average_precision_score,
+)
 import warnings
 warnings.filterwarnings('ignore')
 from bnn_train import NetworkBNN, load_and_preprocess_data
@@ -15,7 +23,7 @@ from bnn_train import NetworkBNN, load_and_preprocess_data
 # CONFIGURATION
 # ============================================================================
 # Paths
-MODEL_PATH = 'bnn_unsw_nb15_best.pth'
+MODEL_PATH = 'models/bnn.pth'
 TRAIN_PATH = 'data/UNSW_NB15_training-set.csv'
 TEST_PATH = 'data/UNSW_NB15_testing-set.csv'
 OUTPUT_PATH = 'models/predictions.csv'
@@ -24,12 +32,18 @@ OUTPUT_PATH = 'models/predictions.csv'
 MC_SAMPLES = 50
 BATCH_SIZE = 128
 
-# Uncertainty thresholds
+# Three-way decision thresholds (proposal: accept/reject when confident, else defer)
+TAU_BENIGN = 0.9   # p(benign) > τ_benign to accept as benign
+TAU_ATTACK = 0.9   # p(attack) > τ_attack to reject as attack
+ETA = 0.1          # entropy H < η for low uncertainty (normalized entropy in [0,1])
+
+# Uncertainty analysis
 UNCERTAINTY_THRESHOLD_PERCENTILE = 90
 HIGH_CONFIDENCE_THRESHOLD = 0.95
 
 # Display settings
 N_SAMPLE_PREDICTIONS = 5
+N_ECE_BINS = 10
 
 
 # ============================================================================
@@ -103,6 +117,79 @@ def predict_with_uncertainty(model, data_loader, device, mc_samples=50):
 
 
 # ============================================================================
+# CALIBRATION METRICS
+# ============================================================================
+def expected_calibration_error(probs, targets, n_bins=10):
+    """Expected Calibration Error: weighted average of |accuracy - confidence| per bin."""
+    bin_boundaries = np.linspace(0, 1, n_bins + 1)
+    ece = 0.0
+    preds = probs.argmax(axis=1)
+    confidences = probs.max(axis=1)
+    for i in range(n_bins):
+        in_bin = (confidences > bin_boundaries[i]) & (confidences <= bin_boundaries[i + 1])
+        prop = in_bin.mean()
+        if prop > 0:
+            acc = (preds[in_bin] == targets[in_bin]).mean()
+            avg_conf = confidences[in_bin].mean()
+            ece += prop * np.abs(acc - avg_conf)
+    return float(ece)
+
+
+def brier_multi(probs, targets, n_classes=2):
+    """Brier score for multi-class: mean squared error between prob and one-hot target."""
+    n = len(targets)
+    one_hot = np.zeros((n, n_classes))
+    one_hot[np.arange(n), targets] = 1
+    return float(np.mean(np.sum((probs - one_hot) ** 2, axis=1)))
+
+
+# ============================================================================
+# THREE-WAY DECISION (accept / reject / defer)
+# ============================================================================
+def three_way_decision(probs, uncertainties, tau_benign=0.9, tau_attack=0.9, eta=0.1):
+    """
+    Accept (benign) if p(benign) > τ_benign and H < η;
+    Reject (attack) if p(attack) > τ_attack and H < η;
+    else Defer to human.
+    probs: (N, 2) with [prob_normal, prob_attack]; uncertainties: normalized entropy (0-1).
+    Returns: array of 'accept', 'reject', 'defer'.
+    """
+    p_benign = probs[:, 0]
+    p_attack = probs[:, 1]
+    low_entropy = uncertainties < eta
+    accept = (p_benign > tau_benign) & low_entropy
+    reject = (p_attack > tau_attack) & low_entropy & ~accept
+    decisions = np.where(accept, 'accept', np.where(reject, 'reject', 'defer'))
+    return decisions
+
+
+def report_three_way(decisions, targets, predictions):
+    """Report counts/rates for accept, reject, defer; accuracy on non-deferred; deferral rate."""
+    n = len(decisions)
+    n_accept = (decisions == 'accept').sum()
+    n_reject = (decisions == 'reject').sum()
+    n_defer = (decisions == 'defer').sum()
+    deferral_rate = n_defer / n if n else 0
+
+    non_deferred = decisions != 'defer'
+    n_non_def = non_deferred.sum()
+    if n_non_def > 0:
+        acc_non_deferred = (predictions[non_deferred] == targets[non_deferred]).mean()
+    else:
+        acc_non_deferred = float('nan')
+
+    print("\n" + "=" * 70)
+    print("THREE-WAY DECISION (accept / reject / defer)")
+    print("=" * 70)
+    print(f"\n  Accept (benign): {n_accept} ({100 * n_accept / n:.1f}%)")
+    print(f"  Reject (attack): {n_reject} ({100 * n_reject / n:.1f}%)")
+    print(f"  Defer:          {n_defer} ({100 * deferral_rate:.1f}%)")
+    print(f"\n  Deferral rate:        {100 * deferral_rate:.2f}%")
+    print(f"  Accuracy (non-deferred): {100 * acc_non_deferred:.2f}%" if not np.isnan(acc_non_deferred) else "  Accuracy (non-deferred): N/A (all deferred)")
+    return deferral_rate, acc_non_deferred
+
+
+# ============================================================================
 # UNCERTAINTY ANALYSIS
 # ============================================================================
 def analyze_uncertainty(predictions, uncertainties, confidences, targets,
@@ -147,9 +234,9 @@ def analyze_uncertainty(predictions, uncertainties, confidences, targets,
 # SAVE AND DISPLAY PREDICTIONS
 # ============================================================================
 def save_predictions(predictions, confidences, uncertainties, probs,
-                     targets, output_path=OUTPUT_PATH):
-    """Save predictions with uncertainty metrics to CSV"""
-    results_df = pd.DataFrame({
+                     targets, decisions=None, output_path=OUTPUT_PATH):
+    """Save predictions with uncertainty metrics and three-way decision to CSV"""
+    data = {
         'true_label': targets,
         'predicted_label': predictions,
         'prediction': ['Attack' if p == 1 else 'Normal' for p in predictions],
@@ -157,9 +244,11 @@ def save_predictions(predictions, confidences, uncertainties, probs,
         'uncertainty': uncertainties,
         'prob_normal': probs[:, 0],
         'prob_attack': probs[:, 1],
-        'correct': predictions == targets
-    })
-
+        'correct': predictions == targets,
+    }
+    if decisions is not None:
+        data['decision'] = decisions
+    results_df = pd.DataFrame(data)
     results_df.to_csv(output_path, index=False)
     print(f"\nPredictions saved to: {output_path}")
     return results_df
@@ -199,9 +288,12 @@ def main_classify(model_path=MODEL_PATH,
                   test_path=TEST_PATH,
                   mc_samples=MC_SAMPLES,
                   batch_size=BATCH_SIZE,
-                  output_path=OUTPUT_PATH):
+                  output_path=OUTPUT_PATH,
+                  tau_benign=TAU_BENIGN,
+                  tau_attack=TAU_ATTACK,
+                  eta=ETA):
     """
-    Main classification function with uncertainty quantification
+    Main classification function with uncertainty quantification and three-way decision.
 
     Args:
         model_path: Path to trained model checkpoint
@@ -210,6 +302,9 @@ def main_classify(model_path=MODEL_PATH,
         mc_samples: Number of Monte Carlo samples for uncertainty estimation
         batch_size: Batch size for inference
         output_path: Path to save predictions CSV
+        tau_benign: Threshold for accept (benign); p(benign) > tau_benign
+        tau_attack: Threshold for reject (attack); p(attack) > tau_attack
+        eta: Entropy threshold; H < eta for low uncertainty (normalized [0,1])
     """
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}\n")
@@ -226,10 +321,13 @@ def main_classify(model_path=MODEL_PATH,
     )
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
-    # Initialize and load model
+    # Initialize and load model (use checkpoint metadata if present)
     print(f"Loading model from: {model_path}")
-    model = NetworkBNN(X_train.shape[1], hidden_dim=256, n_classes=2).to(device)
     checkpoint = torch.load(model_path, map_location=device)
+    input_dim = checkpoint.get('input_dim', X_train.shape[1])
+    hidden_dim = checkpoint.get('hidden_dim', 256)
+    n_classes = checkpoint.get('n_classes', 2)
+    model = NetworkBNN(input_dim, hidden_dim=hidden_dim, n_classes=n_classes).to(device)
     model.load_state_dict(checkpoint['model_state_dict'])
     print(f"Model loaded successfully (trained F1: {checkpoint['test_f1'] * 100:.2f}%)\n")
 
@@ -238,7 +336,7 @@ def main_classify(model_path=MODEL_PATH,
         model, test_loader, device, mc_samples=mc_samples
     )
 
-    # Calculate metrics
+    # Classification metrics
     print("\n" + "=" * 70)
     print("CLASSIFICATION PERFORMANCE")
     print("=" * 70)
@@ -254,6 +352,23 @@ def main_classify(model_path=MODEL_PATH,
     print(f"  Recall:    {rec * 100:.2f}%")
     print(f"  F1-Score:  {f1 * 100:.2f}%")
 
+    # AUC-ROC and AUC-PR
+    try:
+        auc_roc = roc_auc_score(targets, probs[:, 1])
+        auc_pr = average_precision_score(targets, probs[:, 1])
+        print(f"  AUC-ROC:   {auc_roc:.4f}")
+        print(f"  AUC-PR:    {auc_pr:.4f}")
+    except Exception:
+        print(f"  AUC-ROC:   N/A")
+        print(f"  AUC-PR:    N/A")
+
+    # Calibration: ECE and Brier
+    ece = expected_calibration_error(probs, targets, n_bins=N_ECE_BINS)
+    brier = brier_multi(probs, targets, n_classes=n_classes)
+    print(f"\nCalibration:")
+    print(f"  ECE (expected calibration error): {ece:.4f}")
+    print(f"  Brier score: {brier:.4f}")
+
     # Confusion matrix
     cm = confusion_matrix(targets, predictions)
     print(f"\nConfusion Matrix:")
@@ -267,20 +382,23 @@ def main_classify(model_path=MODEL_PATH,
     print(f"  Normal Traffic:")
     print(f"    True Positives:  {cm[0, 0]} (correctly identified as normal)")
     print(f"    False Negatives: {cm[0, 1]} (normal misclassified as attack)")
-
     print(f"  Attack Traffic:")
     print(f"    True Positives:  {cm[1, 1]} (correctly identified as attack)")
     print(f"    False Negatives: {cm[1, 0]} (attack misclassified as normal)")
 
-    # Analyze uncertainty
+    # Three-way decision (accept / reject / defer)
+    decisions = three_way_decision(probs, uncertainties, tau_benign, tau_attack, eta)
+    report_three_way(decisions, targets, predictions)
+
+    # Uncertainty analysis
     analyze_uncertainty(predictions, uncertainties, confidences, targets,
                        UNCERTAINTY_THRESHOLD_PERCENTILE)
 
-    # Save predictions
+    # Save predictions (including decision column)
     results_df = save_predictions(predictions, confidences, uncertainties,
-                                  probs, targets, output_path)
+                                  probs, targets, decisions=decisions, output_path=output_path)
 
-    # Show some example predictions
+    # Sample predictions
     show_sample_predictions(results_df, N_SAMPLE_PREDICTIONS, HIGH_CONFIDENCE_THRESHOLD)
 
     print("\n" + "=" * 70)
