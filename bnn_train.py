@@ -92,6 +92,14 @@ class BayesianLinear(nn.Module):
                 (self.b_sigma ** 2 + self.b_mu ** 2) / (2 * self.prior_sigma ** 2) - 0.5)
         return kl_w.sum() + kl_b.sum()
 
+    def kl_divergence_to_prior(self, prior_w_mu, prior_w_sigma, prior_b_mu, prior_b_sigma):
+        """KL(current posterior || custom prior) for VCL (prior = previous posterior)."""
+        kl_w = (torch.log(prior_w_sigma / self.w_sigma) +
+                (self.w_sigma ** 2 + (self.w_mu - prior_w_mu) ** 2) / (2 * prior_w_sigma ** 2) - 0.5)
+        kl_b = (torch.log(prior_b_sigma / self.b_sigma) +
+                (self.b_sigma ** 2 + (self.b_mu - prior_b_mu) ** 2) / (2 * prior_b_sigma ** 2) - 0.5)
+        return kl_w.sum() + kl_b.sum()
+
 
 class NetworkBNN(nn.Module):
     """Bayesian Neural Network for Network Intrusion Detection"""
@@ -114,9 +122,29 @@ class NetworkBNN(nn.Module):
         x = self.l4(x, sample)
         return F.log_softmax(x, dim=1)
 
-    def total_kl(self):
-        return (self.l1.kl_divergence() + self.l2.kl_divergence() +
-                self.l3.kl_divergence() + self.l4.kl_divergence())
+    def total_kl(self, prior_params=None):
+        """KL to fixed prior (prior_params=None) or to custom prior (VCL: prior_params = previous posterior)."""
+        if prior_params is None:
+            return (self.l1.kl_divergence() + self.l2.kl_divergence() +
+                    self.l3.kl_divergence() + self.l4.kl_divergence())
+        kl = 0.0
+        for name, layer in [('l1', self.l1), ('l2', self.l2), ('l3', self.l3), ('l4', self.l4)]:
+            pw_mu = prior_params[f'{name}_w_mu']
+            pw_s = prior_params[f'{name}_w_sigma']
+            pb_mu = prior_params[f'{name}_b_mu']
+            pb_s = prior_params[f'{name}_b_sigma']
+            kl = kl + layer.kl_divergence_to_prior(pw_mu, pw_s, pb_mu, pb_s)
+        return kl
+
+    def get_posterior_params(self):
+        """Return current posterior (mu, sigma) for each layer for VCL prior in next window."""
+        out = {}
+        for name, layer in [('l1', self.l1), ('l2', self.l2), ('l3', self.l3), ('l4', self.l4)]:
+            out[f'{name}_w_mu'] = layer.w_mu.detach().clone()
+            out[f'{name}_w_sigma'] = layer.w_sigma.detach().clone()
+            out[f'{name}_b_mu'] = layer.b_mu.detach().clone()
+            out[f'{name}_b_sigma'] = layer.b_sigma.detach().clone()
+        return out
 
 
 # ============================================================================
@@ -201,6 +229,83 @@ def validate(model, loader, device, mc_samples=10):
     f1 = f1_score(all_targets, all_preds, zero_division=0)
 
     return acc, prec, rec, f1, all_preds, all_probs
+
+
+# ============================================================================
+# EPISTEMIC / ALEATORIC UNCERTAINTY (for continual learning)
+# ============================================================================
+def get_epistemic_aleatoric(model, X, device, mc_samples=10, batch_size=512):
+    """
+    Per-sample epistemic and aleatoric uncertainty via MC sampling.
+    Epistemic = H(mean(p)) - E[H(p)] (model uncertainty); aleatoric = E[H(p)] (data noise).
+    Returns epistemic, aleatoric as numpy arrays of shape (N,); values in [0, 1] (normalized by log(2)).
+    """
+    model.eval()
+    epistemic_list, aleatoric_list = [], []
+    max_entropy = np.log(2)
+    X_t = torch.FloatTensor(X).to(device)
+    n = len(X)
+    with torch.no_grad():
+        for start in range(0, n, batch_size):
+            batch = X_t[start:start + batch_size]
+            mc_probs = []
+            for _ in range(mc_samples):
+                out = model(batch, sample=True)
+                mc_probs.append(torch.exp(out))
+            mc_probs = torch.stack(mc_probs)  # (mc, B, n_classes)
+            mean_probs = mc_probs.mean(dim=0)
+            entropy_of_mean = -(mean_probs * torch.log(mean_probs + 1e-10)).sum(dim=1)
+            mean_entropy = -(mc_probs * torch.log(mc_probs + 1e-10)).sum(dim=2).mean(dim=0)
+            epistemic_batch = (entropy_of_mean - mean_entropy).clamp(min=0) / max_entropy
+            aleatoric_batch = mean_entropy / max_entropy
+            epistemic_list.append(epistemic_batch.cpu().numpy())
+            aleatoric_list.append(aleatoric_batch.cpu().numpy())
+    return np.concatenate(epistemic_list), np.concatenate(aleatoric_list)
+
+
+def continual_update_bnn(model, X, y, device, prior_params=None, class_weights=None,
+                         n_epochs=3, batch_size=128, lr=1e-3, kl_weight_max=0.01,
+                         aleatoric_scale=1.0, epistemic_plasticity=0.3, mc_samples_uq=10):
+    """
+    Update BNN on a new stream window with uncertainty-guided learning (VCL + epistemic/aleatoric).
+    - Aleatoric: down-weight noisy samples (sample_weight = 1/(1 + aleatoric_scale * aleatoric)).
+    - Epistemic: increase plasticity when model is uncertain (reduce KL weight by epistemic_plasticity * mean_epistemic).
+    - VCL: if prior_params is not None, use KL to previous posterior as prior.
+    Returns updated model and new prior_params (current posterior) for next window.
+    """
+    # Precompute epistemic/aleatoric for full window (for sample weights and KL scaling)
+    epistemic, aleatoric = get_epistemic_aleatoric(model, X, device, mc_samples=mc_samples_uq, batch_size=batch_size)
+    sample_weights = 1.0 + aleatoric_scale * aleatoric
+    mean_epistemic = float(epistemic.mean())
+    kl_scale = max(0.1, 1.0 - epistemic_plasticity * min(mean_epistemic, 1.0))
+
+    dataset = TensorDataset(
+        torch.FloatTensor(X),
+        torch.LongTensor(y),
+        torch.FloatTensor(sample_weights),
+    )
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
+    if class_weights is None:
+        class_weights = torch.ones(2, device=device)
+    else:
+        class_weights = class_weights.to(device)
+
+    for epoch in range(n_epochs):
+        model.train()
+        for data, target, w in loader:
+            data, target, w = data.to(device), target.to(device), w.to(device)
+            optimizer.zero_grad()
+            output = model(data, sample=True)
+            nll = F.nll_loss(output, target, weight=class_weights, reduction='none')
+            nll = (nll * w).mean()
+            kl = model.total_kl(prior_params) / len(dataset)
+            loss = nll + kl_scale * kl_weight_max * kl
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRADIENT_CLIP_NORM)
+            optimizer.step()
+
+    return model, model.get_posterior_params()
 
 
 # ============================================================================
