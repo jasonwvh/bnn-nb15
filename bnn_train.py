@@ -275,7 +275,7 @@ def continual_update_bnn(model, X, y, device, prior_params=None, class_weights=N
     """
     # Precompute epistemic/aleatoric for full window (for sample weights and KL scaling)
     epistemic, aleatoric = get_epistemic_aleatoric(model, X, device, mc_samples=mc_samples_uq, batch_size=batch_size)
-    sample_weights = 1.0 + aleatoric_scale * aleatoric
+    sample_weights = 1.0 / (1.0 + aleatoric_scale * aleatoric)
     mean_epistemic = float(epistemic.mean())
     kl_scale = max(0.1, 1.0 - epistemic_plasticity * min(mean_epistemic, 1.0))
 

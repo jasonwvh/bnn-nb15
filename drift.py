@@ -68,10 +68,10 @@ def make_drift_windows(X_test, y_test, n_windows=5, drift_type='gradual', drift_
         # FIX: RE-NORMALIZE AFTER DRIFT INJECTION
         # This preserves the input distribution that BNN expects
         # ================================================================
-        if i > 0 and drift_type != 'none':
-            # Re-normalize the drifted window so BNN can process it
-            scaler_window = RobustScaler()
-            X_w = scaler_window.fit_transform(X_w)
+        # if i > 0 and drift_type != 'none':
+        #     # Re-normalize the drifted window so BNN can process it
+        #     scaler_window = RobustScaler()
+        #     X_w = scaler_window.fit_transform(X_w)
         # ================================================================
         
         windows.append((X_w, y_w))
