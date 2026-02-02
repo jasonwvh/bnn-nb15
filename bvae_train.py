@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import time
 from torch.utils.data import TensorDataset, DataLoader
 from sklearn.preprocessing import RobustScaler, LabelEncoder
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
@@ -453,6 +454,7 @@ def train_bvae(train_path=TRAIN_PATH, test_path=TEST_PATH,
     Train Bayesian Variational Autoencoder on normal data only
     """
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cpu')
     print(f"Using device: {device}\n")
     
     # Load and preprocess data
@@ -492,8 +494,13 @@ def train_bvae(train_path=TRAIN_PATH, test_path=TEST_PATH,
     
     best_val_loss = float('inf')
     patience_counter = 0
+
+    # timer = time.time()
     
     for epoch in range(epochs):
+        # print(f"Epoch {epoch+1} / {epochs} - Time: {time.time() - timer:.2f}s")
+        # timer = time.time()
+
         # Training
         model.train()
         train_loss = 0
