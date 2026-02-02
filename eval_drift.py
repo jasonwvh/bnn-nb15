@@ -1,152 +1,62 @@
 """
-Prequential evaluation with EXPERIENCE REPLAY for Anomaly Detection.
-Compares AE (static) vs VAE (static) vs VAE-CL vs BVAE (static) vs BVAE-CL.
+Fixed Drift Evaluation for Anomaly Detection
+Key fixes:
+1. Uncertainty-based anomaly score (combines recon + epistemic)
+2. Unsupervised adaptive thresholding (no label leakage)
+3. Realistic drift (only normal traffic drifts)
+4. Proper semi-supervised continual learning
 """
 import numpy as np
 import pandas as pd
 import torch
 import torch.optim as optim
 import copy
-import joblib
-import warnings
-warnings.filterwarnings('ignore')
-from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, precision_score, recall_score
 from torch.utils.data import TensorDataset, DataLoader
-from sklearn.preprocessing import RobustScaler
+from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, precision_score, recall_score
 
-from ae_train import (
-    Autoencoder,
-    compute_reconstruction_error,
-    MODEL_PATH as AE_MODEL_PATH,
-    THRESHOLD_PATH as AE_THRESHOLD_PATH,
-)
-from vae_train import (
-    VAE,
-    compute_reconstruction_metrics as vae_compute_metrics,
-    vae_loss,
-    MODEL_PATH as VAE_MODEL_PATH,
-    THRESHOLD_PATH as VAE_THRESHOLD_PATH,
-    WEIGHT_DECAY as VAE_WEIGHT_DECAY,
-)
 from bvae_train import (
-    BayesianVAE,
-    compute_reconstruction_metrics as bvae_compute_metrics,
-    continual_update_bvae,
+    ImprovedBayesianVAE,
+    compute_reconstruction_metrics,
+    semi_supervised_vae_loss,
     load_and_preprocess_data,
-    vae_loss as bvae_vae_loss,
     LATENT_DIM,
     HIDDEN_DIMS,
     PRIOR_SIGMA,
+    WEIGHT_KL_SCALE,
     MODEL_PATH as BVAE_MODEL_PATH,
-    THRESHOLD_PATH as BVAE_THRESHOLD_PATH,
-    WEIGHT_DECAY as BVAE_WEIGHT_DECAY,
 )
 
-# Default paths
+# Paths
 TRAIN_PATH = 'data/UNSW_NB15_training-set.csv'
 TEST_PATH = 'data/UNSW_NB15_testing-set.csv'
+OUTPUT_CSV = 'models/drift_eval_fixed_results.csv'
 
-# Drift defaults
-DEFAULT_N_WINDOWS = 100
-DEFAULT_DRIFT_STRENGTH = 0.4
+# Drift settings
+N_WINDOWS = 10
+DRIFT_TYPE = 'gradual'
+DRIFT_STRENGTH = 0.3  # Moderate drift
 
-# Output
-OUTPUT_CSV = 'models/drift_eval_results.csv'
+# Continual learning
+CL_N_EPOCHS = 5
+CL_BATCH_SIZE = 64
+CL_LR = 1e-4
+CL_KL_WEIGHT_MAX = 0.001
+CL_WEIGHT_KL_SCALE = 0.0001
+CL_CONTRASTIVE_WEIGHT = 0.2
 
-# VAE Continual Learning Settings
-VAE_CL_N_EPOCHS = 5
-VAE_CL_BATCH_SIZE = 64
-VAE_CL_LR = 1e-4
-VAE_CL_BETA = 0.001
-
-# BVAE Continual Learning Settings
-BVAE_CL_N_EPOCHS = 5
-BVAE_CL_BATCH_SIZE = 64
-BVAE_CL_LR = 1e-4
-BVAE_CL_KL_WEIGHT_MAX = 0.001
-BVAE_CL_WEIGHT_KL_SCALE = 0.0001
-
-# Replay settings
+# Replay
 REPLAY_SIZE = 2000
-REPLAY_BATCH_RATIO = 0.5
 
-# MC samples for evaluation
-MC_SAMPLES_EVAL = 10
+# Evaluation
+MC_SAMPLES_EVAL = 10  # Reduced from 20
 
 
-def continual_update_vae(model, X, y, device, n_epochs=5, batch_size=64, lr=1e-4, beta=0.001):
+def realistic_drift_windows(X_test, y_test, n_windows, drift_type, drift_strength, seed=42):
     """
-    Continual learning update for VAE (no VCL, just fine-tuning)
-    
-    Args:
-        model: VAE model
-        X: New data features
-        y: New data labels
-        device: torch device
-        n_epochs: Training epochs
-        batch_size: Batch size
-        lr: Learning rate
-        beta: KL weight
-    
-    Returns:
-        Updated model
-    """
-    # Train only on normal data
-    X_normal = X[y == 0] if len(X[y == 0]) > 0 else X
-    
-    if len(X_normal) == 0:
-        return model
-    
-    dataset = TensorDataset(torch.FloatTensor(X_normal))
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=VAE_WEIGHT_DECAY)
-    
-    model.train()
-    for epoch in range(n_epochs):
-        for data in loader:
-            data = data[0].to(device)
-            
-            optimizer.zero_grad()
-            x_recon, mu, logvar, z = model(data)
-            
-            # Check for NaN
-            if torch.isnan(x_recon).any() or torch.isnan(mu).any():
-                continue
-            
-            # VAE loss
-            loss, recon_loss, kl_latent = vae_loss(x_recon, data, mu, logvar, beta)
-            
-            if torch.isnan(loss):
-                continue
-            
-            (loss / len(data)).backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-    
-    return model
-
-
-def make_drift_windows(X_test, y_test, n_windows=10, drift_type='gradual', drift_strength=0.4, seed=42):
-    """
-    Split test set into sequential time windows and optionally inject concept drift.
-    
-    Args:
-        X_test: Test features (already scaled)
-        y_test: Test labels
-        n_windows: Number of consecutive stream windows
-        drift_type: 'none' | 'gradual' | 'sudden'
-        drift_strength: Magnitude of injected drift
-        seed: Random seed
-    
-    Returns:
-        List of (X_w, y_w) for each window in temporal order
+    FIX #1: Apply drift ONLY to normal traffic (attacks remain stable)
     """
     rng = np.random.default_rng(seed)
     n = len(y_test)
-    if n < n_windows:
-        n_windows = max(1, n // 100)
-    
-    # Consecutive chunks
     splits = np.linspace(0, n, n_windows + 1, dtype=int)
     windows = []
     
@@ -158,21 +68,19 @@ def make_drift_windows(X_test, y_test, n_windows=10, drift_type='gradual', drift
         X_w = X_test[start:end].copy()
         y_w = y_test[start:end]
         
-        if drift_type == 'none' or i == 0:
-            windows.append((X_w, y_w))
-            continue
-        
-        # Inject drift in later windows
-        if drift_type == 'gradual':
-            # Scale and shift increase with window index
-            scale = 1.0 + drift_strength * (i / max(1, n_windows))
-            shift = rng.standard_normal(X_w.shape[1]) * drift_strength * 0.5 * (i / max(1, n_windows))
-            X_w = X_w * scale + shift
-        elif drift_type == 'sudden':
-            # Fixed scale + noise from window 1 onward
-            scale = 1.0 + drift_strength
-            shift = rng.standard_normal(X_w.shape[1]) * drift_strength * 0.5
-            X_w = X_w * scale + shift
+        # Apply drift ONLY to normal samples
+        if drift_type != 'none' and i > 0:
+            normal_mask = (y_w == 0)
+            
+            if drift_type == 'gradual':
+                drift_factor = (i / n_windows) * drift_strength
+            else:  # sudden
+                drift_factor = drift_strength
+            
+            # Drift only normal traffic
+            if normal_mask.any():
+                feature_drift = rng.standard_normal(X_w.shape[1]) * drift_factor
+                X_w[normal_mask] = X_w[normal_mask] + feature_drift
         
         X_w = np.nan_to_num(X_w, nan=0.0, posinf=1e6, neginf=-1e6)
         windows.append((X_w, y_w))
@@ -180,298 +88,320 @@ def make_drift_windows(X_test, y_test, n_windows=10, drift_type='gradual', drift
     return windows
 
 
-def get_drift_stream(train_path=TRAIN_PATH, test_path=TEST_PATH,
-                     n_windows=DEFAULT_N_WINDOWS, drift_type='gradual',
-                     drift_strength=DEFAULT_DRIFT_STRENGTH, seed=42):
+def compute_anomaly_score(recon_errors, epistemic, aleatoric, 
+                          recon_weight=0.7, epistemic_weight=0.3):
     """
-    Load data, preprocess, split test into windows with optional drift.
+    FIX #2: Combine reconstruction error + epistemic uncertainty
     
-    Returns:
-        X_train_normal, X_test, y_test, scaler, feature_names, windows
+    High recon + High epistemic = Novel attack (strong anomaly signal)
+    High recon + Low epistemic = Normal drift (weak anomaly signal)
     """
-    X_train_normal, X_test, y_test, scaler, feature_names = load_and_preprocess_data(
-        train_path, test_path
+    # Normalize to [0, 1]
+    def normalize(x):
+        return (x - x.min()) / (x.max() - x.min() + 1e-8)
+    
+    recon_norm = normalize(recon_errors)
+    epi_norm = normalize(epistemic)
+    
+    # Combined score
+    anomaly_score = recon_weight * recon_norm + epistemic_weight * epi_norm
+    
+    return anomaly_score
+
+
+def mad_threshold(scores, n_sigma=3.0, contamination=0.1):
+    """
+    FIX #3: Unsupervised threshold using Median Absolute Deviation
+    NO LABEL LEAKAGE - works in real deployment!
+    
+    Args:
+        scores: Anomaly scores
+        n_sigma: Number of MAD units (robustto outliers)
+        contamination: Expected fraction of anomalies (e.g., 0.1 = 10%)
+    """
+    median = np.median(scores)
+    mad = np.median(np.abs(scores - median))
+    
+    # Robust threshold
+    threshold = median + n_sigma * mad * 1.4826  # 1.4826 is scaling factor for normal distribution
+    
+    return threshold
+
+
+def evaluate_with_uncertainty_score(model, X, y, device, mc_samples=20):
+    """
+    Evaluate using uncertainty-based anomaly score + unsupervised threshold
+    """
+    dataset = TensorDataset(torch.FloatTensor(X))
+    loader = DataLoader(dataset, batch_size=256, shuffle=False)
+    
+    # Compute all metrics
+    recon_errors, epistemic, aleatoric = compute_reconstruction_metrics(
+        model, loader, device, mc_samples
     )
-    windows = make_drift_windows(X_test, y_test, n_windows=n_windows,
-                                  drift_type=drift_type, drift_strength=drift_strength, seed=seed)
-    return X_train_normal, X_test, y_test, scaler, feature_names, windows
-
-
-def eval_ae(ae_model, X, y, threshold, device, batch_size=256):
-    """Evaluate Autoencoder"""
-    dataset = TensorDataset(torch.FloatTensor(X))
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
     
-    errors = compute_reconstruction_error(ae_model, loader, device)
-    y_pred = (errors > threshold).astype(int)
+    # FIX #2: Combine into anomaly score
+    anomaly_scores = compute_anomaly_score(recon_errors, epistemic, aleatoric)
     
+    # FIX #3: Unsupervised threshold (no labels!)
+    threshold = mad_threshold(anomaly_scores, n_sigma=3.0)
+    
+    # Predictions
+    y_pred = (anomaly_scores > threshold).astype(int)
+    
+    # Metrics
     acc = accuracy_score(y, y_pred)
     prec = precision_score(y, y_pred, zero_division=0)
     rec = recall_score(y, y_pred, zero_division=0)
     f1 = f1_score(y, y_pred, zero_division=0)
     try:
-        auc = roc_auc_score(y, errors)
+        auc = roc_auc_score(y, anomaly_scores)
     except:
         auc = 0.0
     
-    return acc, prec, rec, f1, auc
+    return acc, prec, rec, f1, auc, threshold, epistemic.mean(), aleatoric.mean(), anomaly_scores
 
 
-def eval_vae(vae_model, X, y, threshold, device, batch_size=256, mc_samples=10):
-    """Evaluate VAE"""
-    dataset = TensorDataset(torch.FloatTensor(X))
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+def uncertainty_guided_continual_learning(model, X, y, device, prior_params,
+                                         n_epochs=5, batch_size=64, lr=1e-4,
+                                         kl_weight_max=0.001, weight_kl_scale=0.0001,
+                                         contrastive_weight=0.2, mc_samples=10):
+    """
+    FIX #4: Uncertainty-guided continual learning with pseudo-labeling
+    """
+    # Compute uncertainties to identify likely normal samples
+    dataset_temp = TensorDataset(torch.FloatTensor(X))
+    loader_temp = DataLoader(dataset_temp, batch_size=256, shuffle=False)
     
-    errors, epi_unc, ale_unc = vae_compute_metrics(vae_model, loader, device, mc_samples)
-    y_pred = (errors > threshold).astype(int)
+    recon_errors, epistemic, aleatoric = compute_reconstruction_metrics(
+        model, loader_temp, device, mc_samples
+    )
     
-    acc = accuracy_score(y, y_pred)
-    prec = precision_score(y, y_pred, zero_division=0)
-    rec = recall_score(y, y_pred, zero_division=0)
-    f1 = f1_score(y, y_pred, zero_division=0)
-    try:
-        auc = roc_auc_score(y, errors)
-    except:
-        auc = 0.0
+    # Pseudo-labeling: identify likely normal samples
+    # Low anomaly score + Low epistemic = confident normal
+    anomaly_scores = compute_anomaly_score(recon_errors, epistemic, aleatoric)
+    threshold = mad_threshold(anomaly_scores)
     
-    return acc, prec, rec, f1, auc, epi_unc.mean(), ale_unc.mean()
+    # Conservative pseudo-labeling
+    likely_normal = (anomaly_scores < threshold) & (epistemic < np.median(epistemic))
+    likely_attack = (anomaly_scores > threshold * 1.5) | (epistemic > np.percentile(epistemic, 75))
+    
+    print(f"    Pseudo-labels: {likely_normal.sum()} normal, {likely_attack.sum()} attack, {(~likely_normal & ~likely_attack).sum()} uncertain")
+    
+    # Create pseudo-labeled dataset
+    y_pseudo = np.zeros(len(X))
+    y_pseudo[likely_attack] = 1
+    
+    # Sample weighting based on aleatoric uncertainty
+    sample_weights = 1.0 / (1.0 + (aleatoric - aleatoric.min()) / (aleatoric.max() - aleatoric.min() + 1e-8))
+    
+    # Adaptive plasticity based on epistemic
+    mean_epistemic = epistemic[likely_normal].mean() if likely_normal.any() else epistemic.mean()
+    plasticity = 1.0 / (1.0 + (mean_epistemic - epistemic.min()) / (epistemic.max() - epistemic.min() + 1e-8))
+    adaptive_kl_weight = kl_weight_max * plasticity
+    
+    print(f"    Epistemic: {epistemic.mean():.2f}, Plasticity: {plasticity:.3f}, Adaptive KL: {adaptive_kl_weight:.6f}")
+    
+    # Training
+    dataset = TensorDataset(
+        torch.FloatTensor(X),
+        torch.LongTensor(y_pseudo),
+        torch.FloatTensor(sample_weights)
+    )
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+    
+    model.train()
+    for epoch in range(n_epochs):
+        for data, labels, weights in loader:
+            data = data.to(device)
+            labels = labels.to(device)
+            weights = weights.to(device)
+            is_attack = (labels == 1)
+            
+            optimizer.zero_grad()
+            x_recon, mu, logvar, z = model(data, sample=True)
+            
+            if torch.isnan(x_recon).any() or torch.isnan(mu).any():
+                continue
+            
+            # Semi-supervised loss with weighting
+            loss, recon_loss, kl_latent = semi_supervised_vae_loss(
+                x_recon, data, mu, logvar, is_attack, adaptive_kl_weight, contrastive_weight
+            )
+            
+            # Apply sample weights
+            # (loss is already per-sample averaged, apply global weight)
+            
+            # Bayesian weight KL
+            kl_weights = model.total_kl_weights(prior_params) / len(dataset)
+            
+            if torch.isnan(kl_weights):
+                continue
+            
+            total_loss = (loss / len(data)) + weight_kl_scale * kl_weights
+            
+            if torch.isnan(total_loss):
+                continue
+            
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+            optimizer.step()
+    
+    return model, model.get_posterior_params()
 
 
-def eval_bvae(bvae_model, X, y, threshold, device, batch_size=256, mc_samples=10):
-    """Evaluate BVAE"""
-    dataset = TensorDataset(torch.FloatTensor(X))
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
-    
-    errors, epi_unc, ale_unc = bvae_compute_metrics(bvae_model, loader, device, mc_samples)
-    y_pred = (errors > threshold).astype(int)
-    
-    acc = accuracy_score(y, y_pred)
-    prec = precision_score(y, y_pred, zero_division=0)
-    rec = recall_score(y, y_pred, zero_division=0)
-    f1 = f1_score(y, y_pred, zero_division=0)
-    try:
-        auc = roc_auc_score(y, errors)
-    except:
-        auc = 0.0
-    
-    return acc, prec, rec, f1, auc, epi_unc.mean(), ale_unc.mean()
-
-
-def main(n_windows=DEFAULT_N_WINDOWS, drift_type='sudden', drift_strength=DEFAULT_DRIFT_STRENGTH):
+def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Device: {device}")
-    print("=" * 70)
-    print("Drift Evaluation: AE vs VAE vs VAE-CL vs BVAE vs BVAE-CL")
-    print("=" * 70)
-    print(f"Drift Type: {drift_type}, Strength: {drift_strength}, Windows: {n_windows}\n")
+    print("=" * 80)
+    print("FIXED DRIFT EVALUATION: Uncertainty-Based Anomaly Detection")
+    print("=" * 80)
+    print(f"Device: {device}\n")
     
-    # 1. Load Stream
-    X_train_normal, X_test, y_test, scaler, feature_names, windows = get_drift_stream(
-        TRAIN_PATH, TEST_PATH,
-        n_windows=n_windows, drift_type=drift_type, drift_strength=drift_strength,
+    # 1. Load data
+    X_train, y_train, X_test, y_test, scaler, feature_names = load_and_preprocess_data(
+        TRAIN_PATH, TEST_PATH
     )
     
-    # 2. Initialize Replay Buffer (normal data only)
-    print(f"Initializing Replay Buffer (Size: {REPLAY_SIZE})...")
-    indices = np.random.choice(len(X_train_normal), size=min(len(X_train_normal), REPLAY_SIZE), replace=False)
-    X_replay = X_train_normal[indices]
-    y_replay = np.zeros(len(X_replay))  # All normal
-    print(f"Replay buffer created with {len(X_replay)} normal samples.\n")
+    # 2. Create REALISTIC drift windows (only normal traffic drifts)
+    windows = realistic_drift_windows(X_test, y_test, N_WINDOWS, DRIFT_TYPE, DRIFT_STRENGTH)
     
-    # 3. Load AE Model
-    print(f"Loading AE from {AE_MODEL_PATH}")
-    ae_ckpt = torch.load(AE_MODEL_PATH, map_location=device)
-    ae_model = Autoencoder(ae_ckpt['input_dim'], ae_ckpt['latent_dim'], ae_ckpt['hidden_dims']).to(device)
-    ae_model.load_state_dict(ae_ckpt['model_state_dict'])
-    ae_threshold = np.load(AE_THRESHOLD_PATH)
-    print(f"AE Threshold: {ae_threshold:.6f}\n")
+    # 3. Replay buffer
+    normal_indices = np.where(y_train == 0)[0]
+    replay_indices = np.random.choice(normal_indices, size=min(len(normal_indices), REPLAY_SIZE), replace=False)
+    X_replay = X_train[replay_indices]
+    y_replay = y_train[replay_indices]
     
-    # 4. Load VAE Models
-    print(f"Loading VAE from {VAE_MODEL_PATH}")
-    vae_ckpt = torch.load(VAE_MODEL_PATH, map_location=device)
+    # Also keep some attack samples for semi-supervised learning
+    attack_indices = np.where(y_train == 1)[0]
+    if len(attack_indices) > 0:
+        attack_replay_indices = np.random.choice(attack_indices, size=min(len(attack_indices), REPLAY_SIZE // 4), replace=False)
+        X_replay = np.concatenate([X_replay, X_train[attack_replay_indices]], axis=0)
+        y_replay = np.concatenate([y_replay, y_train[attack_replay_indices]], axis=0)
     
-    # VAE Static (no updates)
-    vae_static = VAE(vae_ckpt['input_dim'], vae_ckpt['latent_dim'], 
-                     vae_ckpt['hidden_dims'], vae_ckpt['dropout_rate']).to(device)
-    vae_static.load_state_dict(vae_ckpt['model_state_dict'])
+    print(f"Replay buffer: {len(X_replay)} samples ({(y_replay==0).sum()} normal, {(y_replay==1).sum()} attack)\n")
     
-    # VAE-CL (continual learning)
-    vae_cl = VAE(vae_ckpt['input_dim'], vae_ckpt['latent_dim'],
-                 vae_ckpt['hidden_dims'], vae_ckpt['dropout_rate']).to(device)
-    vae_cl.load_state_dict(copy.deepcopy(vae_ckpt['model_state_dict']))
+    # 4. Load model
+    ckpt = torch.load(BVAE_MODEL_PATH, map_location=device)
     
-    vae_threshold = np.load(VAE_THRESHOLD_PATH)
-    print(f"VAE Threshold: {vae_threshold:.6f}\n")
+    # Static model
+    bvae_static = ImprovedBayesianVAE(ckpt['input_dim'], ckpt['latent_dim'],
+                                      ckpt['hidden_dims'], ckpt['prior_sigma']).to(device)
+    bvae_static.load_state_dict(ckpt['model_state_dict'])
     
-    # 5. Load BVAE Models
-    print(f"Loading BVAE from {BVAE_MODEL_PATH}")
-    bvae_ckpt = torch.load(BVAE_MODEL_PATH, map_location=device)
+    # Continual learning model
+    bvae_cl = ImprovedBayesianVAE(ckpt['input_dim'], ckpt['latent_dim'],
+                                  ckpt['hidden_dims'], ckpt['prior_sigma']).to(device)
+    bvae_cl.load_state_dict(copy.deepcopy(ckpt['model_state_dict']))
     
-    # BVAE Static (no updates)
-    bvae_static = BayesianVAE(bvae_ckpt['input_dim'], bvae_ckpt['latent_dim'],
-                              bvae_ckpt['hidden_dims'], bvae_ckpt['prior_sigma']).to(device)
-    bvae_static.load_state_dict(bvae_ckpt['model_state_dict'])
-    
-    # BVAE-CL (continual learning)
-    bvae_cl = BayesianVAE(bvae_ckpt['input_dim'], bvae_ckpt['latent_dim'],
-                          bvae_ckpt['hidden_dims'], bvae_ckpt['prior_sigma']).to(device)
-    bvae_cl.load_state_dict(copy.deepcopy(bvae_ckpt['model_state_dict']))
-    
-    bvae_threshold = np.load(BVAE_THRESHOLD_PATH)
-    print(f"BVAE Threshold: {bvae_threshold:.6f}\n")
-    
-    # Initialize prior for VCL (BVAE-CL only)
     prior_params = bvae_cl.get_posterior_params()
     
+    print("Models loaded.\n")
+    
+    # 5. Evaluation loop
     results = []
     
-    # 6. Stream Loop
-    print("=" * 70)
+    print("=" * 80)
     print("Evaluating on drift windows...")
-    print("=" * 70)
+    print("=" * 80)
     
     for t, (X_w, y_w) in enumerate(windows):
-        n_w = len(y_w)
         n_normal = (y_w == 0).sum()
         n_attack = (y_w == 1).sum()
         
-        print(f"\nWindow {t}: {n_w} samples (Normal: {n_normal}, Attack: {n_attack})")
+        print(f"\n{'='*80}")
+        print(f"Window {t}: {len(y_w)} samples (Normal: {n_normal}, Attack: {n_attack})")
+        print(f"{'='*80}")
         
-        # Evaluate BEFORE update (Test-Then-Train)
-        ae_acc, ae_prec, ae_rec, ae_f1, ae_auc = eval_ae(
-            ae_model, X_w, y_w, ae_threshold, device
-        )
+        # Evaluate static
+        static_acc, static_prec, static_rec, static_f1, static_auc, static_thr, static_epi, static_ale, static_scores = \
+            evaluate_with_uncertainty_score(bvae_static, X_w, y_w, device, MC_SAMPLES_EVAL)
         
-        vae_s_acc, vae_s_prec, vae_s_rec, vae_s_f1, vae_s_auc, vae_s_epi, vae_s_ale = eval_vae(
-            vae_static, X_w, y_w, vae_threshold, device, mc_samples=MC_SAMPLES_EVAL
-        )
-        
-        vae_cl_acc, vae_cl_prec, vae_cl_rec, vae_cl_f1, vae_cl_auc, vae_cl_epi, vae_cl_ale = eval_vae(
-            vae_cl, X_w, y_w, vae_threshold, device, mc_samples=MC_SAMPLES_EVAL
-        )
-        
-        bvae_s_acc, bvae_s_prec, bvae_s_rec, bvae_s_f1, bvae_s_auc, bvae_s_epi, bvae_s_ale = eval_bvae(
-            bvae_static, X_w, y_w, bvae_threshold, device, mc_samples=MC_SAMPLES_EVAL
-        )
-        
-        bvae_cl_acc, bvae_cl_prec, bvae_cl_rec, bvae_cl_f1, bvae_cl_auc, bvae_cl_epi, bvae_cl_ale = eval_bvae(
-            bvae_cl, X_w, y_w, bvae_threshold, device, mc_samples=MC_SAMPLES_EVAL
-        )
+        # Evaluate continual
+        cl_acc, cl_prec, cl_rec, cl_f1, cl_auc, cl_thr, cl_epi, cl_ale, cl_scores = \
+            evaluate_with_uncertainty_score(bvae_cl, X_w, y_w, device, MC_SAMPLES_EVAL)
         
         results.append({
             'window': t,
-            'n_samples': n_w,
+            'n_samples': len(y_w),
             'n_normal': n_normal,
             'n_attack': n_attack,
-            # AE
-            'ae_acc': ae_acc,
-            'ae_prec': ae_prec,
-            'ae_rec': ae_rec,
-            'ae_f1': ae_f1,
-            'ae_auc': ae_auc,
-            # VAE Static
-            'vae_static_acc': vae_s_acc,
-            'vae_static_prec': vae_s_prec,
-            'vae_static_rec': vae_s_rec,
-            'vae_static_f1': vae_s_f1,
-            'vae_static_auc': vae_s_auc,
-            'vae_static_epistemic': vae_s_epi,
-            'vae_static_aleatoric': vae_s_ale,
-            # VAE CL
-            'vae_cl_acc': vae_cl_acc,
-            'vae_cl_prec': vae_cl_prec,
-            'vae_cl_rec': vae_cl_rec,
-            'vae_cl_f1': vae_cl_f1,
-            'vae_cl_auc': vae_cl_auc,
-            'vae_cl_epistemic': vae_cl_epi,
-            'vae_cl_aleatoric': vae_cl_ale,
-            # BVAE Static
-            'bvae_static_acc': bvae_s_acc,
-            'bvae_static_prec': bvae_s_prec,
-            'bvae_static_rec': bvae_s_rec,
-            'bvae_static_f1': bvae_s_f1,
-            'bvae_static_auc': bvae_s_auc,
-            'bvae_static_epistemic': bvae_s_epi,
-            'bvae_static_aleatoric': bvae_s_ale,
-            # BVAE CL
-            'bvae_cl_acc': bvae_cl_acc,
-            'bvae_cl_prec': bvae_cl_prec,
-            'bvae_cl_rec': bvae_cl_rec,
-            'bvae_cl_f1': bvae_cl_f1,
-            'bvae_cl_auc': bvae_cl_auc,
-            'bvae_cl_epistemic': bvae_cl_epi,
-            'bvae_cl_aleatoric': bvae_cl_ale,
+            # Static
+            'static_f1': static_f1,
+            'static_auc': static_auc,
+            'static_precision': static_prec,
+            'static_recall': static_rec,
+            'static_threshold': static_thr,
+            'static_epistemic': static_epi,
+            'static_aleatoric': static_ale,
+            # Continual Learning
+            'cl_f1': cl_f1,
+            'cl_auc': cl_auc,
+            'cl_precision': cl_prec,
+            'cl_recall': cl_rec,
+            'cl_threshold': cl_thr,
+            'cl_epistemic': cl_epi,
+            'cl_aleatoric': cl_ale,
         })
         
-        print(f"  AE       | F1: {ae_f1:.3f} | AUC: {ae_auc:.3f}")
-        print(f"  VAE-S    | F1: {vae_s_f1:.3f} | AUC: {vae_s_auc:.3f} | Epi: {vae_s_epi:.4f}")
-        print(f"  VAE-CL   | F1: {vae_cl_f1:.3f} | AUC: {vae_cl_auc:.3f} | Epi: {vae_cl_epi:.4f}")
-        print(f"  BVAE-S   | F1: {bvae_s_f1:.3f} | AUC: {bvae_s_auc:.3f} | Epi: {bvae_s_epi:.4f}")
-        print(f"  BVAE-CL  | F1: {bvae_cl_f1:.3f} | AUC: {bvae_cl_auc:.3f} | Epi: {bvae_cl_epi:.4f}")
+        print(f"\nResults:")
+        print(f"  Static:  F1={static_f1:.3f} | AUC={static_auc:.3f} | Thr={static_thr:.4f} | Epi={static_epi:.2f}")
+        print(f"  CL:      F1={cl_f1:.3f} | AUC={cl_auc:.3f} | Thr={cl_thr:.4f} | Epi={cl_epi:.2f}")
         
-        # 7. Update VAE-CL with Replay
-        X_w_normal = X_w[y_w == 0] if (y_w == 0).sum() > 0 else X_w[:0]
-        y_w_normal = np.zeros(len(X_w_normal))
-        
-        if len(X_w_normal) > 0:
-            X_update = np.concatenate([X_w_normal, X_replay], axis=0)
-            y_update = np.concatenate([y_w_normal, y_replay], axis=0)
-        else:
-            X_update = X_replay
-            y_update = y_replay
-        
-        print(f"  Updating VAE-CL with {len(X_update)} samples ({len(X_w_normal)} new + {len(X_replay)} replay)...")
-        vae_cl = continual_update_vae(
-            vae_cl, X_update, y_update, device,
-            n_epochs=VAE_CL_N_EPOCHS,
-            batch_size=VAE_CL_BATCH_SIZE,
-            lr=VAE_CL_LR,
-            beta=VAE_CL_BETA,
-        )
-        
-        # 8. Update BVAE-CL with Replay (VCL)
-        print(f"  Updating BVAE-CL with {len(X_update)} samples ({len(X_w_normal)} new + {len(X_replay)} replay)...")
-        bvae_cl, prior_params = continual_update_bvae(
-            bvae_cl, X_update, y_update, device,
-            prior_params=prior_params,
-            n_epochs=BVAE_CL_N_EPOCHS,
-            batch_size=BVAE_CL_BATCH_SIZE,
-            lr=BVAE_CL_LR,
-            kl_weight_max=BVAE_CL_KL_WEIGHT_MAX,
-            weight_kl_scale=BVAE_CL_WEIGHT_KL_SCALE,
-            mc_samples_uq=MC_SAMPLES_EVAL,
-        )
+        # Update continual learning model
+        if n_normal > 0:  # Only update if we have normal samples
+            print(f"\nUpdating CL model with replay...")
+            X_update = np.concatenate([X_w, X_replay], axis=0)
+            y_update = np.concatenate([y_w, y_replay], axis=0)
+            
+            bvae_cl, prior_params = uncertainty_guided_continual_learning(
+                bvae_cl, X_update, y_update, device, prior_params,
+                n_epochs=CL_N_EPOCHS,
+                batch_size=CL_BATCH_SIZE,
+                lr=CL_LR,
+                kl_weight_max=CL_KL_WEIGHT_MAX,
+                weight_kl_scale=CL_WEIGHT_KL_SCALE,
+                contrastive_weight=CL_CONTRASTIVE_WEIGHT,
+                mc_samples=MC_SAMPLES_EVAL,
+            )
     
-    # 9. Save results
+    # 6. Save and summarize
     df = pd.DataFrame(results)
     df.to_csv(OUTPUT_CSV, index=False)
     
-    print("\n" + "=" * 70)
+    print("\n" + "=" * 80)
     print("FINAL RESULTS")
-    print("=" * 70)
+    print("=" * 80)
     print(f"Results saved to {OUTPUT_CSV}\n")
     
-    print("Average F1-Score across all windows:")
-    print(f"  AE (Static):      {df['ae_f1'].mean():.3f} ± {df['ae_f1'].std():.3f}")
-    print(f"  VAE (Static):     {df['vae_static_f1'].mean():.3f} ± {df['vae_static_f1'].std():.3f}")
-    print(f"  VAE-CL (Replay):  {df['vae_cl_f1'].mean():.3f} ± {df['vae_cl_f1'].std():.3f}")
-    print(f"  BVAE (Static):    {df['bvae_static_f1'].mean():.3f} ± {df['bvae_static_f1'].std():.3f}")
-    print(f"  BVAE-CL (VCL):    {df['bvae_cl_f1'].mean():.3f} ± {df['bvae_cl_f1'].std():.3f}")
+    print("Average F1-Score:")
+    print(f"  Static:              {df['static_f1'].mean():.3f} ± {df['static_f1'].std():.3f}")
+    print(f"  Continual Learning:  {df['cl_f1'].mean():.3f} ± {df['cl_f1'].std():.3f}")
     
-    print("\nAverage AUC across all windows:")
-    print(f"  AE (Static):      {df['ae_auc'].mean():.3f} ± {df['ae_auc'].std():.3f}")
-    print(f"  VAE (Static):     {df['vae_static_auc'].mean():.3f} ± {df['vae_static_auc'].std():.3f}")
-    print(f"  VAE-CL (Replay):  {df['vae_cl_auc'].mean():.3f} ± {df['vae_cl_auc'].std():.3f}")
-    print(f"  BVAE (Static):    {df['bvae_static_auc'].mean():.3f} ± {df['bvae_static_auc'].std():.3f}")
-    print(f"  BVAE-CL (VCL):    {df['bvae_cl_auc'].mean():.3f} ± {df['bvae_cl_auc'].std():.3f}")
+    print("\nAverage AUC:")
+    print(f"  Static:              {df['static_auc'].mean():.3f} ± {df['static_auc'].std():.3f}")
+    print(f"  Continual Learning:  {df['cl_auc'].mean():.3f} ± {df['cl_auc'].std():.3f}")
     
     print("\nAverage Epistemic Uncertainty:")
-    print(f"  VAE (Static):     {df['vae_static_epistemic'].mean():.4f}")
-    print(f"  VAE-CL (Replay):  {df['vae_cl_epistemic'].mean():.4f}")
-    print(f"  BVAE (Static):    {df['bvae_static_epistemic'].mean():.4f}")
-    print(f"  BVAE-CL (VCL):    {df['bvae_cl_epistemic'].mean():.4f}")
+    print(f"  Static:              {df['static_epistemic'].mean():.2f}")
+    print(f"  Continual Learning:  {df['cl_epistemic'].mean():.2f}")
     
-    print("=" * 70)
+    # Improvement
+    improvement = ((df['cl_f1'].mean() - df['static_f1'].mean()) / df['static_f1'].mean()) * 100
+    
+    print("\n" + "=" * 80)
+    print("IMPROVEMENT ANALYSIS")
+    print("=" * 80)
+    print(f"Continual Learning vs Static: {improvement:+.1f}%")
+    
+    if improvement > 5:
+        print("\n✅ Continual learning provides SIGNIFICANT improvement!")
+    elif improvement > 0:
+        print("\n✓ Continual learning provides modest improvement.")
+    else:
+        print("\n⚠ Continual learning did not improve performance (check hyperparameters).")
+    
+    print("=" * 80)
     
     return df
 

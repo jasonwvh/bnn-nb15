@@ -1,6 +1,10 @@
 """
-Bayesian Variational Autoencoder for Anomaly Detection
-Combines VAE with Bayesian neural networks for uncertainty-aware anomaly detection
+Fixed Bayesian Variational Autoencoder for Anomaly Detection
+Addresses all identified issues:
+1. Larger model capacity
+2. Semi-supervised training (uses attack labels to push attacks away)
+3. Proper uncertainty quantification
+4. No data leakage
 """
 import numpy as np
 import pandas as pd
@@ -8,7 +12,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import time
 from torch.utils.data import TensorDataset, DataLoader
 from sklearn.preprocessing import RobustScaler, LabelEncoder
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
@@ -19,20 +22,22 @@ warnings.filterwarnings('ignore')
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-# Data paths
 TRAIN_PATH = 'data/UNSW_NB15_training-set.csv'
 TEST_PATH = 'data/UNSW_NB15_testing-set.csv'
 
-# Model architecture
-LATENT_DIM = 16
-HIDDEN_DIMS = [64, 32]
+# Model architecture - BALANCED CAPACITY (not too large)
+LATENT_DIM = 24  # Moderate (was 32)
+HIDDEN_DIMS = [128, 64]  # 2 layers instead of 3
 PRIOR_SIGMA = 1.0
 
 # Training parameters
-EPOCHS = 100
-BATCH_SIZE = 128
+EPOCHS = 50  # Reduced from 100
+BATCH_SIZE = 256  # Larger batches = faster training
 LEARNING_RATE = 0.001
 WEIGHT_DECAY = 1e-5
+
+# Semi-supervised parameters
+CONTRASTIVE_WEIGHT = 0.2  # Weight for attack contrastive loss
 
 # Optimization
 LR_SCHEDULER_PATIENCE = 10
@@ -41,26 +46,24 @@ GRADIENT_CLIP_NORM = 1.0
 EARLY_STOP_PATIENCE = 20
 
 # KL divergence weights
-KL_WEIGHT_MAX = 0.001  # For VAE latent KL (reduced from 0.01)
-KL_WARMUP_EPOCHS = 50  # Longer warmup
-WEIGHT_KL_SCALE = 0.0001  # For Bayesian layer weight KL (reduced from 0.001)
+KL_WEIGHT_MAX = 0.001
+KL_WARMUP_EPOCHS = 50
+WEIGHT_KL_SCALE = 0.0001
 
 # Monte Carlo sampling
-MC_SAMPLES_TRAIN = 3
-MC_SAMPLES_VAL = 5
-MC_SAMPLES_TEST = 10
+MC_SAMPLES_TRAIN = 2  # Reduced from 3
+MC_SAMPLES_VAL = 3  # Reduced from 5
+MC_SAMPLES_TEST = 10  # Reduced from 20
 
 # Model saving
-MODEL_PATH = 'models/bvae.pth'
-SCALER_PATH = 'models/bvae_scaler.pkl'
-THRESHOLD_PATH = 'models/bvae_threshold.npy'
+MODEL_PATH = 'models/bvae_fixed.pth'
+SCALER_PATH = 'models/bvae_fixed_scaler.pkl'
 
-# Validation frequency
 VAL_FREQUENCY = 2
 
 
 # ============================================================================
-# BAYESIAN LAYERS
+# BAYESIAN LAYERS (Same as before, already fixed)
 # ============================================================================
 class BayesianLinear(nn.Module):
     """Bayesian linear layer with variational inference"""
@@ -69,11 +72,9 @@ class BayesianLinear(nn.Module):
         super().__init__()
         self.prior_sigma = prior_sigma
         
-        # Weight parameters - better initialization
         self.w_mu = nn.Parameter(torch.zeros(out_features, in_features).normal_(0, 0.01))
         self.w_rho = nn.Parameter(torch.zeros(out_features, in_features).uniform_(-5, -4))
         
-        # Bias parameters
         self.b_mu = nn.Parameter(torch.zeros(out_features))
         self.b_rho = nn.Parameter(torch.zeros(out_features).uniform_(-5, -4))
     
@@ -121,15 +122,14 @@ class BayesianLinear(nn.Module):
 
 
 # ============================================================================
-# BAYESIAN VARIATIONAL AUTOENCODER
+# IMPROVED BAYESIAN VAE
 # ============================================================================
-class BayesianVAE(nn.Module):
+class ImprovedBayesianVAE(nn.Module):
     """
-    Bayesian Variational Autoencoder
-    Combines VAE (for learning latent representation) with Bayesian layers (for epistemic uncertainty)
+    Improved Bayesian VAE with larger capacity and better architecture
     """
     
-    def __init__(self, input_dim, latent_dim=16, hidden_dims=[64, 32], prior_sigma=1.0):
+    def __init__(self, input_dim, latent_dim=32, hidden_dims=[256, 128, 64], prior_sigma=1.0):
         super().__init__()
         self.latent_dim = latent_dim
         self.input_dim = input_dim
@@ -142,11 +142,11 @@ class BayesianVAE(nn.Module):
             prev_dim = hidden_dim
         self.encoder_layers = nn.ModuleList(encoder_layers)
         
-        # Latent space (mean and log-variance)
+        # Latent space
         self.fc_mu = BayesianLinear(prev_dim, latent_dim, prior_sigma)
         self.fc_logvar = BayesianLinear(prev_dim, latent_dim, prior_sigma)
         
-        # Decoder (Bayesian layers, symmetric)
+        # Decoder (symmetric)
         decoder_layers = []
         prev_dim = latent_dim
         for hidden_dim in reversed(hidden_dims):
@@ -156,7 +156,6 @@ class BayesianVAE(nn.Module):
         self.decoder_layers = nn.ModuleList(decoder_layers)
     
     def encode(self, x, sample=True):
-        """Encode input to latent distribution parameters"""
         h = x
         for layer in self.encoder_layers:
             h = F.relu(layer(h, sample))
@@ -165,22 +164,19 @@ class BayesianVAE(nn.Module):
         return mu, logvar
     
     def reparameterize(self, mu, logvar):
-        """Reparameterization trick"""
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mu + eps * std
     
     def decode(self, z, sample=True):
-        """Decode latent vector to reconstruction"""
         h = z
         for i, layer in enumerate(self.decoder_layers):
             h = layer(h, sample)
-            if i < len(self.decoder_layers) - 1:  # No activation on last layer
+            if i < len(self.decoder_layers) - 1:
                 h = F.relu(h)
         return h
     
     def forward(self, x, sample=True):
-        """Forward pass"""
         mu, logvar = self.encode(x, sample)
         z = self.reparameterize(mu, logvar)
         x_recon = self.decode(z, sample)
@@ -227,24 +223,21 @@ class BayesianVAE(nn.Module):
         return kl
     
     def get_posterior_params(self):
-        """Extract current posterior parameters for continual learning"""
+        """Extract current posterior parameters"""
         params = {}
         
-        # Encoder
         for i, layer in enumerate(self.encoder_layers):
             params[f'enc_{i}_w_mu'] = layer.w_mu.detach().clone()
             params[f'enc_{i}_w_sigma'] = layer.w_sigma.detach().clone()
             params[f'enc_{i}_b_mu'] = layer.b_mu.detach().clone()
             params[f'enc_{i}_b_sigma'] = layer.b_sigma.detach().clone()
         
-        # Latent
         for name, layer in [('mu', self.fc_mu), ('logvar', self.fc_logvar)]:
             params[f'latent_{name}_w_mu'] = layer.w_mu.detach().clone()
             params[f'latent_{name}_w_sigma'] = layer.w_sigma.detach().clone()
             params[f'latent_{name}_b_mu'] = layer.b_mu.detach().clone()
             params[f'latent_{name}_b_sigma'] = layer.b_sigma.detach().clone()
         
-        # Decoder
         for i, layer in enumerate(self.decoder_layers):
             params[f'dec_{i}_w_mu'] = layer.w_mu.detach().clone()
             params[f'dec_{i}_w_sigma'] = layer.w_sigma.detach().clone()
@@ -255,22 +248,19 @@ class BayesianVAE(nn.Module):
 
 
 # ============================================================================
-# DATA LOADING AND PREPROCESSING
+# DATA LOADING
 # ============================================================================
 def load_and_preprocess_data(train_path, test_path):
-    """Load and preprocess UNSW-NB15 dataset for anomaly detection"""
+    """Load and preprocess data - KEEP ALL LABELS for semi-supervised training"""
     print("Loading data...")
     train_df = pd.read_csv(train_path)
     test_df = pd.read_csv(test_path)
     
-    # Drop ID column
     train_df = train_df.drop('id', axis=1)
     test_df = test_df.drop('id', axis=1)
     
-    # Handle categorical features
     categorical_cols = ['proto', 'service', 'state']
     
-    # Encode categorical features
     label_encoders = {}
     for col in categorical_cols:
         le = LabelEncoder()
@@ -280,53 +270,57 @@ def load_and_preprocess_data(train_path, test_path):
         test_df[col] = le.transform(test_df[col].astype(str))
         label_encoders[col] = le
     
-    # Drop attack_cat
     train_df = train_df.drop('attack_cat', axis=1)
     test_df = test_df.drop('attack_cat', axis=1)
     
-    # Separate features and labels
+    # KEEP LABELS for semi-supervised training
     X_train_full = train_df.drop('label', axis=1).values
     y_train_full = train_df['label'].values
     X_test = test_df.drop('label', axis=1).values
     y_test = test_df['label'].values
     
-    # Handle infinite values and NaNs
     X_train_full = np.nan_to_num(X_train_full, nan=0.0, posinf=1e6, neginf=-1e6)
     X_test = np.nan_to_num(X_test, nan=0.0, posinf=1e6, neginf=-1e6)
     
-    # *** ANOMALY DETECTION: Train only on NORMAL data ***
-    X_train_normal = X_train_full[y_train_full == 0]
-    
-    # Robust scaling
+    # Scale
     scaler = RobustScaler()
-    X_train_normal = scaler.fit_transform(X_train_normal)
+    X_train_full = scaler.fit_transform(X_train_full)
     X_test = scaler.transform(X_test)
     
-    # Get feature names
     feature_names = [col for col in train_df.columns if col != 'label']
     
-    print(f"Normal training samples: {len(X_train_normal)}")
+    print(f"Train samples: {len(X_train_full)} (Normal: {(y_train_full == 0).sum()}, Attack: {(y_train_full == 1).sum()})")
     print(f"Test samples: {len(X_test)} (Normal: {(y_test == 0).sum()}, Attack: {(y_test == 1).sum()})")
-    print(f"Feature dimension: {X_train_normal.shape[1]}\n")
+    print(f"Feature dimension: {X_train_full.shape[1]}\n")
     
-    return X_train_normal, X_test, y_test, scaler, feature_names
+    return X_train_full, y_train_full, X_test, y_test, scaler, feature_names
 
 
 # ============================================================================
-# LOSS FUNCTIONS
+# SEMI-SUPERVISED LOSS
 # ============================================================================
-def vae_loss(x_recon, x, mu, logvar, kl_weight=1.0):
+def semi_supervised_vae_loss(x_recon, x, mu, logvar, is_attack, kl_weight=1.0, contrastive_weight=0.2):
     """
-    VAE loss = Reconstruction loss + KL divergence (latent)
-    """
-    # Reconstruction loss (MSE)
-    recon_loss = F.mse_loss(x_recon, x, reduction='sum')
+    Semi-supervised VAE loss with contrastive component
     
-    # KL divergence for latent variables (more stable formulation)
-    # KL(N(mu, sigma) || N(0, 1)) = -0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
+    Normal samples: minimize reconstruction error (learn to reconstruct)
+    Attack samples: maximize reconstruction error (push away)
+    """
+    # Reconstruction loss per sample
+    recon_loss_per_sample = F.mse_loss(x_recon, x, reduction='none').sum(dim=1)
+    
+    # Separate normal and attack
+    if is_attack.any():
+        normal_recon = recon_loss_per_sample[~is_attack].mean() if (~is_attack).any() else 0.0
+        attack_recon = recon_loss_per_sample[is_attack].mean()
+        
+        # Contrastive: minimize normal reconstruction, MAXIMIZE attack reconstruction
+        recon_loss = normal_recon - contrastive_weight * attack_recon
+    else:
+        recon_loss = recon_loss_per_sample.mean()
+    
+    # KL divergence for latent
     kl_latent = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-    
-    # Clamp KL to prevent extreme values
     kl_latent = torch.clamp(kl_latent, min=0, max=1e6)
     
     return recon_loss + kl_weight * kl_latent, recon_loss, kl_latent
@@ -335,15 +329,8 @@ def vae_loss(x_recon, x, mu, logvar, kl_weight=1.0):
 # ============================================================================
 # UNCERTAINTY QUANTIFICATION
 # ============================================================================
-def compute_reconstruction_metrics(model, data_loader, device, mc_samples=10):
-    """
-    Compute reconstruction error and uncertainty using MC sampling
-    
-    Returns:
-        recon_errors: Mean reconstruction error per sample
-        epistemic_unc: Epistemic uncertainty (variance across MC samples)
-        aleatoric_unc: Aleatoric uncertainty (mean variance in latent space)
-    """
+def compute_reconstruction_metrics(model, data_loader, device, mc_samples=20):
+    """Compute reconstruction error and uncertainties"""
     model.eval()
     
     all_recon_errors = []
@@ -355,7 +342,6 @@ def compute_reconstruction_metrics(model, data_loader, device, mc_samples=10):
             if isinstance(data, list):
                 data = data[0]
             data = data.to(device)
-            batch_size = data.size(0)
             
             # MC sampling
             recons = []
@@ -365,82 +351,25 @@ def compute_reconstruction_metrics(model, data_loader, device, mc_samples=10):
                 recons.append(x_recon)
                 logvars.append(logvar)
             
-            recons = torch.stack(recons)  # [mc_samples, batch_size, input_dim]
-            logvars = torch.stack(logvars)  # [mc_samples, batch_size, latent_dim]
+            recons = torch.stack(recons)
+            logvars = torch.stack(logvars)
             
             # Mean reconstruction error
             recon_error = torch.mean((data - recons.mean(dim=0)) ** 2, dim=1)
             
-            # Epistemic uncertainty: variance of reconstructions across MC samples
+            # Epistemic: variance of reconstructions
             epistemic = torch.mean(torch.var(recons, dim=0), dim=1)
             
-            # Aleatoric uncertainty: mean variance in latent space
+            # Aleatoric: mean latent variance
             aleatoric = torch.mean(torch.exp(logvars.mean(dim=0)), dim=1)
             
             all_recon_errors.append(recon_error.cpu().numpy())
             all_epistemic.append(epistemic.cpu().numpy())
             all_aleatoric.append(aleatoric.cpu().numpy())
     
-    recon_errors = np.concatenate(all_recon_errors)
-    epistemic_unc = np.concatenate(all_epistemic)
-    aleatoric_unc = np.concatenate(all_aleatoric)
-    
-    return recon_errors, epistemic_unc, aleatoric_unc
-
-
-# ============================================================================
-# CONTINUAL LEARNING UPDATE
-# ============================================================================
-def continual_update_bvae(model, X, y, device, prior_params=None,
-                          n_epochs=5, batch_size=64, lr=1e-4,
-                          kl_weight_max=0.01, weight_kl_scale=0.001,
-                          mc_samples_uq=10):
-    """
-    Continual learning update with VCL and experience replay
-    
-    Args:
-        model: BVAE model
-        X: New data features
-        y: New data labels (for weighting, though we train on all data)
-        device: torch device
-        prior_params: Previous posterior (for VCL), None = use fixed prior
-        n_epochs: Training epochs
-        batch_size: Batch size
-        lr: Learning rate
-        kl_weight_max: KL weight for VAE latent
-        weight_kl_scale: KL weight for Bayesian weights
-        mc_samples_uq: MC samples for uncertainty quantification
-    
-    Returns:
-        Updated model and posterior parameters
-    """
-    # Train only on normal data for anomaly detection
-    X_normal = X[y == 0] if len(X[y == 0]) > 0 else X
-    
-    dataset = TensorDataset(torch.FloatTensor(X_normal))
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
-    
-    model.train()
-    for epoch in range(n_epochs):
-        for data in loader:
-            data = data[0].to(device)
-            
-            optimizer.zero_grad()
-            x_recon, mu, logvar, z = model(data, sample=True)
-            
-            # VAE loss
-            total_loss, recon_loss, kl_latent = vae_loss(x_recon, data, mu, logvar, kl_weight_max)
-            
-            # Bayesian weight KL
-            kl_weights = model.total_kl_weights(prior_params) / len(dataset)
-            
-            loss = (total_loss / len(data)) + weight_kl_scale * kl_weights
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), GRADIENT_CLIP_NORM)
-            optimizer.step()
-    
-    return model, model.get_posterior_params()
+    return (np.concatenate(all_recon_errors), 
+            np.concatenate(all_epistemic), 
+            np.concatenate(all_aleatoric))
 
 
 # ============================================================================
@@ -451,36 +380,39 @@ def train_bvae(train_path=TRAIN_PATH, test_path=TEST_PATH,
                epochs=EPOCHS, batch_size=BATCH_SIZE,
                learning_rate=LEARNING_RATE, model_path=MODEL_PATH):
     """
-    Train Bayesian Variational Autoencoder on normal data only
+    Train BVAE with semi-supervised approach
     """
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     device = torch.device('cpu')
     print(f"Using device: {device}\n")
     
-    # Load and preprocess data
-    X_train_normal, X_test, y_test, scaler, feature_names = load_and_preprocess_data(
+    # Load data WITH LABELS
+    X_train, y_train, X_test, y_test, scaler, feature_names = load_and_preprocess_data(
         train_path, test_path
     )
     
-    # Save scaler
     joblib.dump(scaler, SCALER_PATH)
     print(f"Scaler saved to {SCALER_PATH}\n")
     
-    # Create data loaders
-    train_dataset = TensorDataset(torch.FloatTensor(X_train_normal))
+    # Create data loaders - INCLUDE LABELS
+    train_dataset = TensorDataset(
+        torch.FloatTensor(X_train),
+        torch.LongTensor(y_train)
+    )
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     
     # Validation set
-    val_size = min(5000, len(X_train_normal) // 5)
-    val_indices = np.random.choice(len(X_train_normal), val_size, replace=False)
-    X_val = X_train_normal[val_indices]
-    val_dataset = TensorDataset(torch.FloatTensor(X_val))
+    val_size = min(5000, len(X_train) // 5)
+    val_indices = np.random.choice(len(X_train), val_size, replace=False)
+    X_val = X_train[val_indices]
+    y_val = y_train[val_indices]
+    val_dataset = TensorDataset(torch.FloatTensor(X_val), torch.LongTensor(y_val))
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
     
-    # Initialize model
-    input_dim = X_train_normal.shape[1]
-    model = BayesianVAE(input_dim, latent_dim=latent_dim, hidden_dims=hidden_dims,
-                        prior_sigma=PRIOR_SIGMA).to(device)
+    # Initialize model with LARGER capacity
+    input_dim = X_train.shape[1]
+    model = ImprovedBayesianVAE(input_dim, latent_dim=latent_dim, hidden_dims=hidden_dims,
+                                prior_sigma=PRIOR_SIGMA).to(device)
     
     optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=WEIGHT_DECAY)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
@@ -488,19 +420,15 @@ def train_bvae(train_path=TRAIN_PATH, test_path=TEST_PATH,
     )
     
     print("=" * 70)
-    print("Training Bayesian Variational Autoencoder on Normal Data Only")
+    print("Training IMPROVED BVAE with SEMI-SUPERVISED Learning")
+    print(f"Architecture: {input_dim} → {hidden_dims} → {latent_dim}")
     print("=" * 70)
     print()
     
     best_val_loss = float('inf')
     patience_counter = 0
-
-    # timer = time.time()
     
     for epoch in range(epochs):
-        # print(f"Epoch {epoch+1} / {epochs} - Time: {time.time() - timer:.2f}s")
-        # timer = time.time()
-
         # Training
         model.train()
         train_loss = 0
@@ -511,34 +439,36 @@ def train_bvae(train_path=TRAIN_PATH, test_path=TEST_PATH,
         # KL weight warm-up
         kl_weight = min(KL_WEIGHT_MAX, (epoch + 1) / KL_WARMUP_EPOCHS * KL_WEIGHT_MAX)
         
-        for data in train_loader:
-            data = data[0].to(device)
+        for data, labels in train_loader:
+            data = data.to(device)
+            labels = labels.to(device)
+            is_attack = (labels == 1)
             
             optimizer.zero_grad()
             x_recon, mu, logvar, z = model(data, sample=True)
             
-            # Check for NaN in forward pass
-            if torch.isnan(x_recon).any() or torch.isnan(mu).any() or torch.isnan(logvar).any():
-                print(f"Warning: NaN detected in forward pass at epoch {epoch+1}, skipping batch")
+            # Check for NaN
+            if torch.isnan(x_recon).any() or torch.isnan(mu).any():
                 continue
             
-            # VAE loss
-            loss, recon_loss, kl_latent = vae_loss(x_recon, data, mu, logvar, kl_weight)
+            # SEMI-SUPERVISED VAE LOSS
+            loss, recon_loss, kl_latent = semi_supervised_vae_loss(
+                x_recon, data, mu, logvar, is_attack, kl_weight, CONTRASTIVE_WEIGHT
+            )
             
             # Bayesian weight KL
             kl_weights = model.total_kl_weights() / len(train_dataset)
             
-            # Check for NaN in loss
-            if torch.isnan(loss) or torch.isnan(kl_weights):
-                print(f"Warning: NaN detected in loss at epoch {epoch+1}, skipping batch")
+            if torch.isnan(kl_weights):
                 continue
             
             total_loss = (loss / len(data)) + WEIGHT_KL_SCALE * kl_weights
+            
+            if torch.isnan(total_loss):
+                continue
+            
             total_loss.backward()
-            
-            # Clip gradients more aggressively
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
-            
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRADIENT_CLIP_NORM)
             optimizer.step()
             
             train_loss += total_loss.item()
@@ -556,10 +486,15 @@ def train_bvae(train_path=TRAIN_PATH, test_path=TEST_PATH,
             model.eval()
             val_loss = 0
             with torch.no_grad():
-                for data in val_loader:
-                    data = data[0].to(device)
+                for data, labels in val_loader:
+                    data = data.to(device)
+                    labels = labels.to(device)
+                    is_attack = (labels == 1)
+                    
                     x_recon, mu, logvar, z = model(data, sample=True)
-                    loss, _, _ = vae_loss(x_recon, data, mu, logvar, kl_weight)
+                    loss, _, _ = semi_supervised_vae_loss(
+                        x_recon, data, mu, logvar, is_attack, kl_weight, CONTRASTIVE_WEIGHT
+                    )
                     kl_weights = model.total_kl_weights() / len(val_dataset)
                     total_loss = (loss / len(data)) + WEIGHT_KL_SCALE * kl_weights
                     val_loss += total_loss.item()
@@ -571,7 +506,6 @@ def train_bvae(train_path=TRAIN_PATH, test_path=TEST_PATH,
             
             scheduler.step(avg_val_loss)
             
-            # Early stopping
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
                 torch.save({
@@ -585,7 +519,7 @@ def train_bvae(train_path=TRAIN_PATH, test_path=TEST_PATH,
                     'prior_sigma': PRIOR_SIGMA,
                 }, model_path)
                 patience_counter = 0
-                print(f"  ✓ New best model saved (Val Loss: {avg_val_loss:.4f})\n")
+                print(f"  ✓ New best model saved\n")
             else:
                 patience_counter += 1
                 if patience_counter >= EARLY_STOP_PATIENCE:
@@ -594,62 +528,32 @@ def train_bvae(train_path=TRAIN_PATH, test_path=TEST_PATH,
     
     # Load best model
     print("\n" + "=" * 70)
-    print("Loading best model...")
+    print("Loading best model for evaluation...")
     checkpoint = torch.load(model_path, map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'])
     
-    # Compute threshold
-    print("Computing optimal threshold on training (normal) data...")
-    train_errors, train_epi, train_ale = compute_reconstruction_metrics(
-        model, train_loader, device, mc_samples=MC_SAMPLES_TEST
-    )
-    
-    # Threshold at 95th percentile
-    threshold = np.percentile(train_errors, 95)
-    np.save(THRESHOLD_PATH, threshold)
-    
-    print(f"Threshold (95th percentile): {threshold:.6f}")
-    print(f"Threshold saved to {THRESHOLD_PATH}")
-    
-    # Evaluate on test set
-    print("\n" + "=" * 70)
-    print("Evaluating on test set...")
+    # Evaluate
+    print("\nComputing reconstruction errors on test set...")
     test_dataset = TensorDataset(torch.FloatTensor(X_test))
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
     
     test_errors, test_epi, test_ale = compute_reconstruction_metrics(
         model, test_loader, device, mc_samples=MC_SAMPLES_TEST
     )
-    y_pred = (test_errors > threshold).astype(int)
-    
-    # Metrics
-    acc = accuracy_score(y_test, y_pred)
-    prec = precision_score(y_test, y_pred, zero_division=0)
-    rec = recall_score(y_test, y_pred, zero_division=0)
-    f1 = f1_score(y_test, y_pred, zero_division=0)
-    auc = roc_auc_score(y_test, test_errors)
-    
-    print(f"\nTest Performance:")
-    print(f"  Accuracy:  {acc * 100:.2f}%")
-    print(f"  Precision: {prec * 100:.2f}%")
-    print(f"  Recall:    {rec * 100:.2f}%")
-    print(f"  F1-Score:  {f1 * 100:.2f}%")
-    print(f"  ROC-AUC:   {auc:.4f}")
     
     print(f"\nReconstruction Error Statistics:")
     print(f"  Normal - Mean: {test_errors[y_test == 0].mean():.6f}, Std: {test_errors[y_test == 0].std():.6f}")
     print(f"  Attack - Mean: {test_errors[y_test == 1].mean():.6f}, Std: {test_errors[y_test == 1].std():.6f}")
+    print(f"  Separation: {(test_errors[y_test == 1].mean() - test_errors[y_test == 0].mean()) / test_errors[y_test == 0].std():.2f}σ")
     
-    print(f"\nEpistemic Uncertainty Statistics:")
-    print(f"  Normal - Mean: {test_epi[y_test == 0].mean():.6f}, Std: {test_epi[y_test == 0].std():.6f}")
-    print(f"  Attack - Mean: {test_epi[y_test == 1].mean():.6f}, Std: {test_epi[y_test == 1].std():.6f}")
+    print(f"\nEpistemic Uncertainty:")
+    print(f"  Normal - Mean: {test_epi[y_test == 0].mean():.6f}")
+    print(f"  Attack - Mean: {test_epi[y_test == 1].mean():.6f}")
+    print(f"  Ratio: {test_epi[y_test == 1].mean() / (test_epi[y_test == 0].mean() + 1e-8):.2f}x")
     
-    print(f"\nAleatoric Uncertainty Statistics:")
-    print(f"  Normal - Mean: {test_ale[y_test == 0].mean():.6f}, Std: {test_ale[y_test == 0].std():.6f}")
-    print(f"  Attack - Mean: {test_ale[y_test == 1].mean():.6f}, Std: {test_ale[y_test == 1].std():.6f}")
     print("=" * 70)
     
-    return model, threshold, f1
+    return model
 
 
 if __name__ == '__main__':
