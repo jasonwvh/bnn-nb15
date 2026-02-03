@@ -49,10 +49,10 @@ class BaselineMLP(nn.Module):
         logits = self.network(x)
         return F.log_softmax(logits, dim=1)
     
-    def loss(self, x, target):
+    def loss(self, x, target, class_weights=None):
         """Compute loss."""
         outputs = self.forward(x)
-        return F.nll_loss(outputs, target)
+        return F.nll_loss(outputs, target, weight=class_weights)
     
     def predict(self, x):
         """Predict class labels."""
@@ -98,9 +98,9 @@ class DeterministicBayesianModel(nn.Module):
         x = self.layers[-1](x, samples)
         return F.log_softmax(x, dim=2)
     
-    def loss(self, x, target, samples=1):
+    def loss(self, x, target, samples=1, class_weights=None):
         outputs = self.forward(x, samples)
-        return F.nll_loss(outputs.mean(0), target)
+        return F.nll_loss(outputs.mean(0), target, weight=class_weights)
     
     def predict(self, x, samples=10):
         self.eval()
@@ -146,8 +146,8 @@ class EWCModel(nn.Module):
     def forward(self, x):
         return F.log_softmax(self.network(x), dim=1)
     
-    def loss(self, x, target):
-        nll = F.nll_loss(self.forward(x), target)
+    def loss(self, x, target, class_weights=None):
+        nll = F.nll_loss(self.forward(x), target, weight=class_weights)
         
         # Add EWC penalty
         ewc_loss = 0
@@ -223,8 +223,8 @@ class ExperienceReplay(nn.Module):
     def forward(self, x):
         return F.log_softmax(self.network(x), dim=1)
     
-    def loss(self, x, target):
-        return F.nll_loss(self.forward(x), target)
+    def loss(self, x, target, class_weights=None):
+        return F.nll_loss(self.forward(x), target, weight=class_weights)
     
     def add_to_buffer(self, X, y):
         """Add samples to replay buffer."""

@@ -7,7 +7,10 @@ Data preprocessing and concept drift simulation for UNSW-NB15
 import pandas as pd
 import numpy as np
 import torch
-from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
 from sklearn.model_selection import train_test_split
 from torch.utils.data import Dataset, DataLoader
 
@@ -46,51 +49,61 @@ def load_and_preprocess_unsw(train_path, test_path):
     # Features to exclude
     exclude_cols = ['id', 'attack_cat', 'label']
     
-    # Categorical features that need encoding
+    # Categorical features (UNSW-NB15 known categoricals)
     categorical_features = ['proto', 'service', 'state']
-    
-    # Process categorical features
-    label_encoders = {}
-    for col in categorical_features:
-        if col in train_df.columns:
-            le = LabelEncoder()
-            # Fit on combined data to ensure consistent encoding
-            combined = pd.concat([train_df[col], test_df[col]], axis=0)
-            le.fit(combined.fillna('missing'))
-            
-            train_df[col] = le.transform(train_df[col].fillna('missing'))
-            test_df[col] = le.transform(test_df[col].fillna('missing'))
-            label_encoders[col] = le
     
     # Get feature columns
     feature_cols = [col for col in train_df.columns if col not in exclude_cols]
     
-    # Extract features and labels
-    X_train = train_df[feature_cols].values
+    # Extract labels
     y_train = train_df['label'].values
-    X_test = test_df[feature_cols].values
     y_test = test_df['label'].values
-    
-    # Handle missing values
-    X_train = np.nan_to_num(X_train, nan=0.0)
-    X_test = np.nan_to_num(X_test, nan=0.0)
-    
-    # Standardize features
-    scaler = StandardScaler()
-    X_train = scaler.fit_transform(X_train)
-    X_test = scaler.transform(X_test)
+
+    # Split feature columns into numeric / categorical
+    cat_cols = [c for c in categorical_features if c in feature_cols]
+    num_cols = [c for c in feature_cols if c not in cat_cols]
+
+    # Preprocess: impute + scale numeric; impute + one-hot categorical
+    numeric_transformer = Pipeline(steps=[
+        ('imputer', SimpleImputer(strategy='median')),
+        ('scaler', StandardScaler())
+    ])
+    categorical_transformer = Pipeline(steps=[
+        ('imputer', SimpleImputer(strategy='most_frequent')),
+        ('onehot', OneHotEncoder(handle_unknown='ignore'))
+    ])
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('num', numeric_transformer, num_cols),
+            ('cat', categorical_transformer, cat_cols)
+        ]
+    )
+
+    # Fit on train only (avoid leakage), transform train/test
+    X_train = preprocessor.fit_transform(train_df[feature_cols])
+    X_test = preprocessor.transform(test_df[feature_cols])
+
+    # Convert to dense arrays for PyTorch dataset
+    if hasattr(X_train, 'toarray'):
+        X_train = X_train.toarray()
+        X_test = X_test.toarray()
     
     print(f"Feature dimension: {X_train.shape[1]}")
     print(f"Training labels - Normal: {(y_train==0).sum()}, Attack: {(y_train==1).sum()}")
     print(f"Test labels - Normal: {(y_test==0).sum()}, Attack: {(y_test==1).sum()}")
     
-    return (X_train, y_train), (X_test, y_test), feature_cols, {
-        'scaler': scaler,
-        'label_encoders': label_encoders
+    # Feature names after preprocessing (best-effort)
+    try:
+        feature_names = preprocessor.get_feature_names_out()
+    except Exception:
+        feature_names = feature_cols
+
+    return (X_train, y_train), (X_test, y_test), feature_names, {
+        'preprocessor': preprocessor
     }
 
 
-def simulate_concept_drift(X, y, drift_type='sudden', num_drifts=3):
+def simulate_concept_drift(X, y, drift_type='sudden', num_drifts=3, shuffle=True, random_state=42):
     """
     Simulate concept drift in the data.
     
@@ -105,41 +118,60 @@ def simulate_concept_drift(X, y, drift_type='sudden', num_drifts=3):
         drift_points: Indices where drifts occur
     """
     n_samples = len(X)
+
+    # UNSW-NB15 is ordered by label in the raw CSV. If we split by index without
+    # shuffling, concepts can become single-class, which collapses learning and
+    # makes metrics meaningless. Shuffle once by default for fair concepts.
+    if shuffle:
+        rng = np.random.default_rng(random_state)
+        perm = rng.permutation(n_samples)
+        X = X[perm]
+        y = y[perm]
+
+    # Stratified split so each concept has a similar class balance.
+    idx0 = np.where(y == 0)[0]
+    idx1 = np.where(y == 1)[0]
+    if len(idx0) == 0 or len(idx1) == 0:
+        raise ValueError("Cannot create stratified concepts: one class is missing.")
+
+    rng = np.random.default_rng(random_state)
+    rng.shuffle(idx0)
+    rng.shuffle(idx1)
+    idx0_chunks = np.array_split(idx0, num_drifts)
+    idx1_chunks = np.array_split(idx1, num_drifts)
     
     if drift_type == 'sudden':
-        # Sudden drift: Split data into distinct chunks
-        drift_points = np.linspace(0, n_samples, num_drifts + 1, dtype=int)
+        # Sudden drift: stratified chunks with distinct shifts
         datasets = []
+        drift_points = []
         
         for i in range(num_drifts):
-            start_idx = drift_points[i]
-            end_idx = drift_points[i + 1]
-            
-            X_chunk = X[start_idx:end_idx]
-            y_chunk = y[start_idx:end_idx]
+            concept_idx = np.concatenate([idx0_chunks[i], idx1_chunks[i]])
+            rng.shuffle(concept_idx)
+            X_chunk = X[concept_idx]
+            y_chunk = y[concept_idx]
             
             # Apply distribution shift: scale features differently for each concept
             shift_factor = 1.0 + 0.3 * i  # Increasing shift
             noise_scale = 0.1 * (i + 1)  # Increasing noise
             
             X_shifted = X_chunk * shift_factor + np.random.normal(0, noise_scale, X_chunk.shape)
-            
             datasets.append((X_shifted, y_chunk))
+            drift_points.append(len(X_chunk))
         
-        return datasets, drift_points[1:-1]
+        return datasets, np.cumsum(drift_points)[:-1]
     
     elif drift_type == 'gradual':
-        # Gradual drift: Smooth transition between concepts
-        drift_points = np.linspace(0, n_samples, num_drifts + 1, dtype=int)
+        # Gradual drift: Smooth transition within each stratified concept
         datasets = []
+        drift_points = []
         
         for i in range(num_drifts):
-            start_idx = drift_points[i]
-            end_idx = drift_points[i + 1]
-            chunk_size = end_idx - start_idx
-            
-            X_chunk = X[start_idx:end_idx]
-            y_chunk = y[start_idx:end_idx]
+            concept_idx = np.concatenate([idx0_chunks[i], idx1_chunks[i]])
+            rng.shuffle(concept_idx)
+            X_chunk = X[concept_idx]
+            y_chunk = y[concept_idx]
+            chunk_size = len(X_chunk)
             
             # Gradual shift: linearly interpolate between old and new concept
             start_shift = 1.0 + 0.3 * i
@@ -149,18 +181,21 @@ def simulate_concept_drift(X, y, drift_type='sudden', num_drifts=3):
             X_shifted = X_chunk * shifts[:, np.newaxis]
             
             datasets.append((X_shifted, y_chunk))
+            drift_points.append(chunk_size)
         
-        return datasets, drift_points[1:-1]
+        return datasets, np.cumsum(drift_points)[:-1]
     
     elif drift_type == 'incremental':
-        # Incremental drift: Small continuous changes
-        X_shifted = X.copy()
+        # Incremental drift: Continuous changes over the stratified sequence
+        order = np.concatenate([np.concatenate([idx0_chunks[i], idx1_chunks[i]]) for i in range(num_drifts)])
+        X_ordered = X[order].copy()
+        y_ordered = y[order]
         
         # Add cumulative drift
         for i in range(n_samples):
             drift_amount = (i / n_samples) * 0.5
             noise = np.random.normal(0, 0.05, X.shape[1])
-            X_shifted[i] = X[i] * (1 + drift_amount) + noise
+            X_ordered[i] = X_ordered[i] * (1 + drift_amount) + noise
         
         # Split into chunks for evaluation
         drift_points = np.linspace(0, n_samples, num_drifts + 1, dtype=int)
@@ -169,7 +204,7 @@ def simulate_concept_drift(X, y, drift_type='sudden', num_drifts=3):
         for i in range(num_drifts):
             start_idx = drift_points[i]
             end_idx = drift_points[i + 1]
-            datasets.append((X_shifted[start_idx:end_idx], y[start_idx:end_idx]))
+            datasets.append((X_ordered[start_idx:end_idx], y_ordered[start_idx:end_idx]))
         
         return datasets, drift_points[1:-1]
     

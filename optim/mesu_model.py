@@ -105,7 +105,7 @@ class MESUAnomalyDetector(nn.Module):
         
         return pred
     
-    def loss(self, x, target, samples=1):
+    def loss(self, x, target, samples=1, class_weights=None):
         """
         Compute negative log likelihood loss.
         
@@ -113,7 +113,7 @@ class MESUAnomalyDetector(nn.Module):
         """
         outputs = self.forward(x, samples)
         # Average over Monte Carlo samples
-        nll = F.nll_loss(outputs.mean(0), target, reduction=self.reduction)
+        nll = F.nll_loss(outputs.mean(0), target, weight=class_weights, reduction=self.reduction)
         return nll * self.coeff_likeli
     
     def predict(self, x, samples=10):

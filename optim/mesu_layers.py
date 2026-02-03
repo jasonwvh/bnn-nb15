@@ -39,7 +39,7 @@ class Linear_MetaBayes(Module):
     __constants__ = ['in_features', 'out_features']
     
     def __init__(self, in_features: int, out_features: int, 
-                 bias: bool = True, sigma_init=0.1, sigma_prior=0.1,
+                 bias: bool = True, sigma_init=None, sigma_prior=0.1,
                  device=None, dtype=None) -> None:
         
         factory_kwargs = {'device': device, 'dtype': dtype}
@@ -51,7 +51,11 @@ class Linear_MetaBayes(Module):
         self.weight_sigma = Parameter(torch.empty((out_features, in_features), **factory_kwargs))
         self.weight_mu = Parameter(torch.empty((out_features, in_features), **factory_kwargs))
         self.bound = math.sqrt(2/in_features)
-        self.sigma_init = sigma_init
+        if sigma_init is None:
+            # Paper-derived init with a floor to avoid vanishing updates on tabular data.
+            self.sigma_init = max(0.1, 0.5 * math.sqrt(1 / out_features))
+        else:
+            self.sigma_init = sigma_init
         self.sigma_prior = sigma_prior
         self.weight = Gaussian_MetaBayes(self.weight_mu, self.weight_sigma)
         

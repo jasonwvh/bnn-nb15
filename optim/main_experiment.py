@@ -18,7 +18,7 @@ from data_utils import (load_and_preprocess_unsw, simulate_concept_drift,
                         create_dataloaders, balance_dataset)
 
 
-def train_epoch(model, dataloader, optimizer, device, is_mesu=True):
+def train_epoch(model, dataloader, optimizer, device, is_mesu=True, class_weights=None):
     """Train for one epoch."""
     model.train()
     total_loss = 0
@@ -28,10 +28,10 @@ def train_epoch(model, dataloader, optimizer, device, is_mesu=True):
         
         if is_mesu:
             optimizer.zero_grad()
-            loss = model.loss(batch_x, batch_y, samples=5)
+            loss = model.loss(batch_x, batch_y, samples=10, class_weights=class_weights)
         else:
             optimizer.zero_grad()
-            loss = model.loss(batch_x, batch_y)
+            loss = model.loss(batch_x, batch_y, class_weights=class_weights)
         
         loss.backward()
         optimizer.step()
@@ -69,12 +69,14 @@ def evaluate_model(model, dataloader, device, is_mesu=True):
     all_probs = np.array(all_probs)
     
     # Compute metrics
+    attack_pred_rate = (all_preds == 1).mean() if len(all_preds) > 0 else 0.0
     metrics = {
         'accuracy': accuracy_score(all_labels, all_preds),
         'precision': precision_score(all_labels, all_preds, zero_division=0),
         'recall': recall_score(all_labels, all_preds, zero_division=0),
         'f1': f1_score(all_labels, all_preds, zero_division=0),
-        'auc': roc_auc_score(all_labels, all_probs) if len(np.unique(all_labels)) > 1 else 0.0
+        'auc': roc_auc_score(all_labels, all_probs) if len(np.unique(all_labels)) > 1 else 0.0,
+        'attack_pred_rate': attack_pred_rate
     }
     
     return metrics
@@ -115,11 +117,13 @@ def train_with_concept_drift(model_type='mesu', drift_type='sudden', num_drifts=
         'input_dim': input_dim,
         'hidden_dims': [128, 64, 32],
         'output_dim': 2,
-        'sigma_init': 0.1,
+        # Use paper-aligned sigma init (layer-dependent) when None.
+        'sigma_init': None,
         'sigma_prior': 0.1,
         'activation': 'Relu',
         'dropout': 0.3,
         'coeff_likeli': 1.0,
+        # Use mean reduction for stable scaling with minibatches.
         'reduction': 'mean'
     }
     
@@ -130,13 +134,14 @@ def train_with_concept_drift(model_type='mesu', drift_type='sudden', num_drifts=
         optimizer_config = {
             'mu_prior': 0.0,
             'sigma_prior': 0.1,
+            # Use dynamic N per concept and moderate learning rates for tabular data.
             'N': 100,
-            'c_sigma': 0.001,
-            'c_mu': 0.001,
+            'c_sigma': 1.0,
+            'c_mu': 5.0,
             'second_order': True,
-            'clamp_sigma': [0.001, 1.0],
+            'clamp_sigma': [1e-4, 0.1],
             'clamp_mu': [0, 0],
-            'ratio_max': 0.1,
+            'ratio_max': 0.5,
             'moment_sigma': 0.9,
             'moment_mu': 0.9
         }
@@ -144,7 +149,7 @@ def train_with_concept_drift(model_type='mesu', drift_type='sudden', num_drifts=
         is_mesu = True
         
     else:  # baseline
-        model = ExperienceReplay(model_config).to(device)
+        model = BaselineMLP(model_config).to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
         is_mesu = False
     
@@ -163,18 +168,31 @@ def train_with_concept_drift(model_type='mesu', drift_type='sudden', num_drifts=
     # Train on each concept sequentially
     for concept_idx, (X_concept, y_concept) in enumerate(drift_datasets):
         print(f"\n--- Concept {concept_idx + 1}/{len(drift_datasets)} ---")
-        print(f"Samples: {len(X_concept)}, Normal: {(y_concept==0).sum()}, Attack: {(y_concept==1).sum()}")
+        normal_count = int((y_concept == 0).sum())
+        attack_count = int((y_concept == 1).sum())
+        print(f"Samples: {len(X_concept)}, Normal: {normal_count}, Attack: {attack_count}")
         
         # Create dataloader for this concept
         concept_loader = create_dataloaders(X_concept, y_concept, batch_size=64, shuffle=True)
         
         # Train on this concept
-        epochs_per_concept = 10
+        epochs_per_concept = 20 if is_mesu else 10
         concept_losses = []
         start_time = time.time()
+
+        # Align MESU's N with the current concept data size (number of batches).
+        if is_mesu:
+            optimizer.N = max(1, len(concept_loader))
         
+        # Compute class weights for this concept (balanced loss)
+        total = max(1, normal_count + attack_count)
+        w0 = total / (2 * max(1, normal_count))
+        w1 = total / (2 * max(1, attack_count))
+        class_weights = torch.tensor([w0, w1], device=device, dtype=torch.float32)
+        print(f"Class weights: normal={w0:.3f}, attack={w1:.3f}")
+
         for epoch in range(epochs_per_concept):
-            loss = train_epoch(model, concept_loader, optimizer, device, is_mesu)
+            loss = train_epoch(model, concept_loader, optimizer, device, is_mesu, class_weights=class_weights)
             concept_losses.append(loss)
             
             if (epoch + 1) % 5 == 0:
@@ -192,6 +210,7 @@ def train_with_concept_drift(model_type='mesu', drift_type='sudden', num_drifts=
         print(f"  Accuracy: {concept_metrics['accuracy']:.4f}")
         print(f"  F1: {concept_metrics['f1']:.4f}")
         print(f"  AUC: {concept_metrics['auc']:.4f}")
+        print(f"  Attack Prediction Rate: {concept_metrics['attack_pred_rate']:.4f}")
         
         # Evaluate on test set (to check forgetting)
         test_metrics = evaluate_model(model, test_loader, device, is_mesu)
@@ -201,6 +220,7 @@ def train_with_concept_drift(model_type='mesu', drift_type='sudden', num_drifts=
         print(f"  Accuracy: {test_metrics['accuracy']:.4f}")
         print(f"  F1: {test_metrics['f1']:.4f}")
         print(f"  AUC: {test_metrics['auc']:.4f}")
+        print(f"  Attack Prediction Rate: {test_metrics['attack_pred_rate']:.4f}")
         print(f"  Training time: {training_time:.2f}s")
     
     # Final evaluation
