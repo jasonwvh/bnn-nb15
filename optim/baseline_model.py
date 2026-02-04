@@ -253,3 +253,133 @@ class ExperienceReplay(nn.Module):
         self.eval()
         with torch.no_grad():
             return self.forward(x).argmax(dim=1)
+
+
+class VCLBayesianModel(nn.Module):
+    """
+    Variational Continual Learning (VCL) baseline.
+    Bayesian model that updates its prior to the previous posterior per concept.
+    """
+    def __init__(self, args_dict):
+        super().__init__()
+        self.input_dim = args_dict.get('input_dim', 42)
+        self.hidden_dims = args_dict.get('hidden_dims', [128, 64, 32])
+        self.output_dim = args_dict.get('output_dim', 2)
+        self.kl_weight = args_dict.get('kl_weight', 1.0)
+        self.train_samples = args_dict.get('train_samples', 5)
+        self.eval_samples = args_dict.get('eval_samples', 10)
+        sigma_init = args_dict.get('sigma_init', 0.1)
+        sigma_prior = args_dict.get('sigma_prior', 0.1)
+
+        self.act = nn.ReLU()
+        self.dropout = nn.Dropout(args_dict.get('dropout', 0.3))
+
+        self.layers = nn.ModuleList()
+        self.layers.append(Linear_MetaBayes(self.input_dim, self.hidden_dims[0],
+                                            sigma_init=sigma_init, sigma_prior=sigma_prior))
+        for i in range(len(self.hidden_dims) - 1):
+            self.layers.append(Linear_MetaBayes(self.hidden_dims[i], self.hidden_dims[i + 1],
+                                                sigma_init=sigma_init, sigma_prior=sigma_prior))
+        self.layers.append(Linear_MetaBayes(self.hidden_dims[-1], self.output_dim,
+                                            sigma_init=sigma_init, sigma_prior=sigma_prior))
+
+        self._register_priors()
+
+    def _register_priors(self):
+        """Initialize prior buffers from the current posterior."""
+        for i, layer in enumerate(self.layers):
+            self.register_buffer(f"w_mu_prior_{i}", layer.weight_mu.detach().clone())
+            self.register_buffer(f"w_sigma_prior_{i}", layer.weight_sigma.detach().clone())
+            if layer.bias is not None:
+                self.register_buffer(f"b_mu_prior_{i}", layer.bias_mu.detach().clone())
+                self.register_buffer(f"b_sigma_prior_{i}", layer.bias_sigma.detach().clone())
+
+    @staticmethod
+    def _kl_gaussian(mu_q, sigma_q, mu_p, sigma_p):
+        sigma_q = torch.clamp(sigma_q, min=1e-6)
+        sigma_p = torch.clamp(sigma_p, min=1e-6)
+        term = torch.log(sigma_p / sigma_q)
+        term += (sigma_q.pow(2) + (mu_q - mu_p).pow(2)) / (2 * sigma_p.pow(2))
+        return term - 0.5
+
+    def kl_divergence(self):
+        """KL(q || p) between current posterior and stored prior."""
+        kl = 0.0
+        for i, layer in enumerate(self.layers):
+            w_mu_prior = getattr(self, f"w_mu_prior_{i}")
+            w_sigma_prior = getattr(self, f"w_sigma_prior_{i}")
+            kl += self._kl_gaussian(layer.weight_mu, layer.weight_sigma,
+                                    w_mu_prior, w_sigma_prior).sum()
+            if layer.bias is not None:
+                b_mu_prior = getattr(self, f"b_mu_prior_{i}")
+                b_sigma_prior = getattr(self, f"b_sigma_prior_{i}")
+                kl += self._kl_gaussian(layer.bias_mu, layer.bias_sigma,
+                                        b_mu_prior, b_sigma_prior).sum()
+        return kl
+
+    def update_prior(self):
+        """Set prior to current posterior (call after finishing a concept)."""
+        for i, layer in enumerate(self.layers):
+            getattr(self, f"w_mu_prior_{i}").copy_(layer.weight_mu.detach())
+            getattr(self, f"w_sigma_prior_{i}").copy_(layer.weight_sigma.detach())
+            if layer.bias is not None:
+                getattr(self, f"b_mu_prior_{i}").copy_(layer.bias_mu.detach())
+                getattr(self, f"b_sigma_prior_{i}").copy_(layer.bias_sigma.detach())
+
+    def forward(self, x, samples=1):
+        for i, layer in enumerate(self.layers[:-1]):
+            x = layer(x, samples)
+            x = self.act(x)
+            if i == len(self.layers) - 2:
+                x = self.dropout(x)
+        x = self.layers[-1](x, samples)
+        return F.log_softmax(x, dim=2)
+
+    def loss(self, x, target, class_weights=None):
+        outputs = self.forward(x, samples=self.train_samples)
+        nll = F.nll_loss(outputs.mean(0), target, weight=class_weights)
+        kl = self.kl_divergence()
+        kl = kl / max(1, x.size(0))
+        return nll + (self.kl_weight * kl)
+
+    def predict(self, x):
+        self.eval()
+        with torch.no_grad():
+            log_probs = self.forward(x, samples=self.eval_samples)
+            probs = torch.exp(log_probs)
+            mean_probs = probs.mean(0)
+            predictions = mean_probs.argmax(dim=1)
+            uncertainties = probs.std(0).mean(1)
+        return predictions, uncertainties
+
+
+class UncertaintyVCLBayesianModel(VCLBayesianModel):
+    """
+    VCL variant that uses predictive uncertainty to mildly guide the KL weight.
+    When uncertain (std across MC samples is high), apply slightly more regularization.
+    When confident, apply slightly less regularization.
+    """
+    def __init__(self, args_dict):
+        super().__init__(args_dict)
+        # Small scaling factor to keep uncertainty influence mild
+        self.uncertainty_scale = args_dict.get('uncertainty_scale', 0.1)
+
+    def loss(self, x, target, class_weights=None):
+        outputs = self.forward(x, samples=self.train_samples)
+        nll = F.nll_loss(outputs.mean(0), target, weight=class_weights)
+
+        # Compute predictive uncertainty from MC samples
+        probs = torch.exp(outputs)  # Shape: [samples, batch_size, num_classes]
+        # Uncertainty: std of predicted probabilities across samples, averaged over classes
+        uncertainty = probs.std(0).mean(dim=1)  # Shape: [batch_size]
+        
+        # Normalize to roughly [0, 1] by clamping
+        uncertainty_normalized = torch.clamp(uncertainty / 0.5, 0.0, 1.0)
+        
+        # Mild adjustment: higher uncertainty -> slightly higher KL penalty
+        # The scale factor (0.1 by default) keeps this effect conservative
+        kl_adjustment = 1.0 + self.uncertainty_scale * uncertainty_normalized.mean()
+
+        kl = self.kl_divergence()
+        kl = kl / max(1, x.size(0))
+        return nll + (self.kl_weight * kl_adjustment * kl)
