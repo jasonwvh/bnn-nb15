@@ -167,7 +167,7 @@ def train_with_concept_drift(model_type='vcl', drift_type='sudden', num_drifts=3
         'test_metrics': [],               # aggregated (mean) test metrics after each concept (for plotting/backwards-compat)
         'training_times': [],
         'losses': [],
-        'initial_accs': [None] * len(test_concept_loaders)
+        'initial_accs': {},  # dict: concept_idx -> accuracy on that concept's test set right after training
     }
 
     for concept_idx, (X_concept, y_concept) in enumerate(drift_datasets):
@@ -210,15 +210,15 @@ def train_with_concept_drift(model_type='vcl', drift_type='sudden', num_drifts=3
         print(f"  Brier: {concept_metrics['brier']:.4f}")
         print(f"  Attack Prediction Rate: {concept_metrics['attack_pred_rate']:.4f}")
 
+        # Record initial accuracy on this concept's test set right after training it
+        concept_test_acc = evaluate_model(model, test_concept_loaders[concept_idx], device, is_bayes=is_bayes)
+        results['initial_accs'][concept_idx] = concept_test_acc['accuracy']
+
         # Evaluate on each concept-specific test set to measure forgetting properly
         per_concept_metrics = []
         for t_idx, t_loader in enumerate(test_concept_loaders):
             m = evaluate_model(model, t_loader, device, is_bayes=is_bayes)
             per_concept_metrics.append(m)
-
-            # Record initial accuracy for a concept right after it was learned
-            if results['initial_accs'][t_idx] is None and t_idx == concept_idx:
-                results['initial_accs'][t_idx] = m['accuracy']
 
         # Aggregate test metrics (mean over concepts) for backward compatibility / plotting
         agg_metrics = {}
@@ -271,13 +271,14 @@ def train_with_concept_drift(model_type='vcl', drift_type='sudden', num_drifts=3
     print(f"  Brier: {final_test_metrics['brier']:.4f}")
 
     # Compute Backward Transfer (BWT) / Forgetting per concept
-    # initial_accs: accuracy on a concept right after learning it
+    # initial_accs: accuracy on a concept right after learning it (from results dict)
     # final_accs: accuracy on same concept after training on all concepts
-    initial_accs = np.array([a if a is not None else 0.0 for a in initial_accs])
+    initial_accs_dict = results['initial_accs']
+    initial_accs = np.array([initial_accs_dict.get(i, 0.0) for i in range(len(final_accs))])
     final_accs = np.array(final_accs)
     bwt_per_concept = final_accs - initial_accs
     bwt = float(np.mean(bwt_per_concept))
-    results['initial_accs'] = initial_accs.tolist()
+    results['initial_accs_list'] = initial_accs.tolist()  # Store list version for compatibility
     results['final_accs'] = final_accs.tolist()
     results['bwt'] = bwt
 
@@ -387,21 +388,21 @@ def main():
         print(f"  Final F1: {vcl_results['test_metrics'][-1]['f1']:.4f}")
         print(f"  Final ECE: {vcl_results['test_metrics'][-1]['ece']:.4f}")
         print(f"  Final Brier: {vcl_results['test_metrics'][-1]['brier']:.4f}")
-        print(f"  Forgetting: {vcl_results.get('forgetting', 0):.4f}")
+        print(f"  BWT: {vcl_results.get('bwt', 0):.4f}")
 
         print("\nBayes VCL-U:")
         print(f"  Final Accuracy: {vcl_u_results['test_metrics'][-1]['accuracy']:.4f}")
         print(f"  Final F1: {vcl_u_results['test_metrics'][-1]['f1']:.4f}")
         print(f"  Final ECE: {vcl_u_results['test_metrics'][-1]['ece']:.4f}")
         print(f"  Final Brier: {vcl_u_results['test_metrics'][-1]['brier']:.4f}")
-        print(f"  Forgetting: {vcl_u_results.get('forgetting', 0):.4f}")
+        print(f"  BWT: {vcl_u_results.get('bwt', 0):.4f}")
 
         print("\nBaseline MLP:")
         print(f"  Final Accuracy: {mlp_results['test_metrics'][-1]['accuracy']:.4f}")
         print(f"  Final F1: {mlp_results['test_metrics'][-1]['f1']:.4f}")
         print(f"  Final ECE: {mlp_results['test_metrics'][-1]['ece']:.4f}")
         print(f"  Final Brier: {mlp_results['test_metrics'][-1]['brier']:.4f}")
-        print(f"  Forgetting: {mlp_results.get('forgetting', 0):.4f}")
+        print(f"  BWT: {mlp_results.get('bwt', 0):.4f}")
 
         print(f"\n{'='*60}\n")
 
