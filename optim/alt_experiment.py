@@ -155,7 +155,7 @@ def train_with_concept_drift(model_type='vcl', drift_type='sudden', num_drifts=3
 
         concept_loader = create_dataloaders(X_concept, y_concept, batch_size=64, shuffle=True)
 
-        epochs_per_concept = 15
+        epochs_per_concept = 10
         concept_losses = []
         start_time = time.time()
 
